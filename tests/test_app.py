@@ -116,6 +116,22 @@ def test_analyze_route_missing(client):
     assert client.post("/analyze", json={}).status_code == 400
 
 
+def test_dcf_route(client):
+    li = [{"account_code": c, "label_verbatim": c, "value": v,
+           "comparatives": [{"period_label": "2022", "value": pv}]}
+          for c, v, pv in [("IS_NET_INCOME", 15000, 13000), ("BS_TOTAL_EQUITY", 100000, 95000)]]
+    filing = {"metadata": {"symbol": "QNBK", "fiscal_year": 2023, "fiscal_period": "FY", "currency": "QAR"},
+              "statements": [{"type": "balance_sheet", "verbatim_text": "x", "line_items": li}]}
+    r = client.post("/dcf", json={"filing": filing, "assumptions": {"growth": 0.05}, "shares": 1000})
+    assert r.status_code == 200
+    j = r.get_json()
+    assert j["valuation"]["model"] == "residual_income" and j["valuation"]["per_share"] is not None
+
+
+def test_dcf_route_missing(client):
+    assert client.post("/dcf", json={}).status_code == 400
+
+
 def test_subsector_taxonomy_maps_to_valid_categories():
     # Every sub-sector the UI offers must map to one of the engine's 5 sectors.
     for sub, cat in app_mod.SUBSECTOR_TO_EXTRACTION.items():

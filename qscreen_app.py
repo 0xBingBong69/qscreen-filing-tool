@@ -30,6 +30,7 @@ from pathlib import Path
 # Reuse the exact, tested engine — do NOT reimplement any of it here.
 import qscreen_ingest as engine
 import qscreen_analyze
+import qscreen_dcf
 
 try:
     from flask import Flask, request, Response, send_file
@@ -89,6 +90,10 @@ PAGE = """<!doctype html>
   .neg { color: #c33; } .pos { color: #0a7; }
   .rep { color: #0a7; cursor: help; font-size: 11px; } ul.flags { margin: 6px 0; padding-left: 0; list-style: none; }
   ul.flags li { padding: 4px 0; font-size: 13px; } ul.flags li.alert { color: #c33; font-weight: 600; } ul.flags li.warn2 { color: #b06b00; }
+  .dcf label { display: inline-block; font-weight: 600; font-size: 12px; margin: 6px 8px 2px 0; }
+  .dcf input { width: 78px; padding: 5px; font-size: 13px; }
+  .dcf button { margin: 8px 0; padding: 8px 14px; font-size: 14px; }
+  .dcfval { font-size: 18px; font-weight: 700; } .grid td.base { background: #fff3cd; font-weight: 700; }
 </style></head><body>
 <h1>QScreen Filing Ingestor</h1>
 <p class="sub">Drop a QSE financial-report PDF, fill the fields, click Extract. Then download the report and upload it to qscreen.app. Type a known symbol and the sub-sector auto-fills.</p>
@@ -175,6 +180,49 @@ function renderSegments(sa){
   }
   return h + '</div>';
 }
+function renderDcfPanel(){
+  return '<div class="seg dcf"><h3>Valuation (DCF) — adjustable</h3>'
+    + '<div><label>Discount rate %</label><input id="d_r" type="number" step="0.5" value="10">'
+    + '<label>Growth %</label><input id="d_g" type="number" step="0.5" placeholder="auto">'
+    + '<label>Terminal %</label><input id="d_tg" type="number" step="0.25" value="2.5">'
+    + '<label>Years</label><input id="d_yr" type="number" value="5">'
+    + '<label>Shares</label><input id="d_sh" type="number" placeholder="optional">'
+    + '<label>Price</label><input id="d_px" type="number" step="0.01" placeholder="optional"></div>'
+    + '<button id="dcfgo">Run valuation</button><div id="dcfout"></div></div>';
+}
+function runDcf(){
+  const num = (id)=>{ const v=document.getElementById(id).value; return v===''?null:Number(v); };
+  const a = { discount_rate:(num('d_r')||10)/100, terminal_growth:(num('d_tg')||2.5)/100, years:num('d_yr')||5 };
+  const g = num('d_g'); if(g!=null) a.growth = g/100;
+  const body = { filing:lastFiling, symbol:lastSymbol, assumptions:a, price:num('d_px'), shares:num('d_sh') };
+  const out = document.getElementById('dcfout'); out.textContent='Computing…';
+  fetch('/dcf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(r=>r.json()).then(d=>{ out.innerHTML = renderDcfResult(d); })
+    .catch(e=>{ out.innerHTML='<span class="err">'+e+'</span>'; });
+}
+function renderDcfResult(d){
+  if(!d || !d.valuation){ return '<span class="warn">'+((d&&d.warnings&&d.warnings.join('; '))||'no valuation')+'</span>'; }
+  const v=d.valuation, ccy=d.reporting_currency||'';
+  const headline = (v.per_share!=null) ? (ccy+' '+v.per_share.toFixed(2)+' / share')
+                                       : (ccy+' '+fmtNum(Math.round(v.equity_value))+' equity value');
+  let h = '<p class="dcfval">'+headline+'</p>';
+  h += '<p class="muted">model: '+v.model+' · terminal '+(v.terminal_pct*100).toFixed(0)+'% of value'
+     + ((d.upside!=null) ? ' · upside <span class="'+(d.upside<0?'neg':'pos')+'">'+(d.upside*100).toFixed(0)+'%</span> vs '+d.price : '')+'</p>';
+  const s=d.sensitivity;
+  if(s){
+    const bg=v.assumptions.growth, br=v.assumptions.discount_rate;
+    h += '<h4>Sensitivity ('+((v.per_share!=null)?'per share':'equity')+') — growth → / discount ↓</h4><table class="seg grid"><tr><th></th>';
+    for(const g of s.growth_values) h+='<th>'+(g*100).toFixed(1)+'%</th>';
+    h+='</tr>';
+    for(let i=0;i<s.rate_values.length;i++){ h+='<tr><th>'+(s.rate_values[i]*100).toFixed(1)+'%</th>';
+      for(let j=0;j<s.growth_values.length;j++){ const cell=s.grid[i][j];
+        const base = Math.abs(s.rate_values[i]-br)<1e-9 && Math.abs(s.growth_values[j]-bg)<1e-9;
+        h+='<td class="'+(base?'base':'')+'">'+((cell==null)?'—':((v.per_share!=null)?Number(cell).toFixed(2):fmtNum(Math.round(cell))))+'</td>'; }
+      h+='</tr>'; }
+    h+='</table>';
+  }
+  return h;
+}
 const PCT_RATIOS = ['roe','roa','nim','cost_income','npl','car','coverage','ldr','net_margin','operating_margin','loss_ratio','expense_ratio','combined_ratio','dividend_payout'];
 function fmtRatio(name, r){
   if(!r || r.value==null) return '—';
@@ -211,7 +259,7 @@ symbolEl.addEventListener('input', () => {
     hintEl.textContent = sym ? (sym + ' not in the known list — pick the sub-sector manually') : '';
   }
 });
-let lastBlob = null, lastName = 'filing.json', lastFiling = null;
+let lastBlob = null, lastName = 'filing.json', lastFiling = null, lastSymbol = '';
 f.onsubmit = async (e) => {
   e.preventDefault();
   go.disabled = true; go.textContent = 'Extracting… (this can take a few minutes)';
@@ -225,11 +273,13 @@ f.onsubmit = async (e) => {
       if (data.problems.length) html += '\\n\\nNotes:\\n - ' + data.problems.join('\\n - ');
       lastBlob = new Blob([JSON.stringify(data.filing, null, 2)], {type:'application/json'});
       lastName = data.filename; lastFiling = data.filing;
+      lastSymbol = (data.filing && data.filing.metadata && data.filing.metadata.symbol) || '';
       html += '\\n\\n<a class="dl" id="dl" href="#">⬇ Download ' + data.filename + '</a>';
       if (UPLOAD_ENABLED && !data.problems.length)
         html += '<a class="dl up" id="up" href="#">⬆ Upload to qscreen.app</a>';
       html += renderSegments((data.analysis||{}).segments);
       html += renderAnalysis(data.analysis);
+      html += renderDcfPanel();
       out.innerHTML = html;
       document.getElementById('dl').onclick = (ev) => {
         ev.preventDefault();
@@ -237,6 +287,8 @@ f.onsubmit = async (e) => {
         const a = document.createElement('a'); a.href = url; a.download = lastName; a.click();
         URL.revokeObjectURL(url);
       };
+      const dg = document.getElementById('dcfgo');
+      if (dg) dg.onclick = (ev) => { ev.preventDefault(); runDcf(); };
       const up = document.getElementById('up');
       if (up) up.onclick = async (ev) => {
         ev.preventDefault();
@@ -369,6 +421,25 @@ def analyze_route():
         return {"error": "could not determine symbol"}, 400
     profile = qatar.profile_for_year(symbol, meta.get("fiscal_year"))
     return qscreen_analyze.analyze(symbol, filings, profile)
+
+
+@app.route("/dcf", methods=["POST"])
+def dcf_route():
+    """Run the valuation simulator for a filing/series with adjustable
+    assumptions. Body: {filing|filings, symbol?, assumptions{}, price?, shares?}."""
+    payload = request.get_json(silent=True) or {}
+    filings = payload.get("filings")
+    if filings is None and isinstance(payload.get("filing"), dict):
+        filings = [payload["filing"]]
+    if not isinstance(filings, list) or not filings:
+        return {"error": "missing 'filings' (list) or 'filing' (object)"}, 400
+    meta = (filings[-1].get("metadata") or {})
+    symbol = payload.get("symbol") or meta.get("symbol") or ""
+    if not symbol:
+        return {"error": "could not determine symbol"}, 400
+    profile = qatar.profile_for_year(symbol, meta.get("fiscal_year"))
+    return qscreen_dcf.value(symbol, filings, profile, payload.get("assumptions") or {},
+                             price=payload.get("price"), shares=payload.get("shares"))
 
 
 @app.route("/segments", methods=["POST"])
