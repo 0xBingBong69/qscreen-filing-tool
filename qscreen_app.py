@@ -33,6 +33,7 @@ import qscreen_analyze
 import qscreen_dcf
 import qscreen_report
 import qscreen_portfolio
+import qscreen_workbook
 
 try:
     from flask import Flask, request, Response, send_file
@@ -103,6 +104,8 @@ PAGE = """<!doctype html>
   table.cmp tr.target { background: #eef6ff; font-weight: 600; } table.cmp .r1 { color: #0a7; font-weight: 700; }
   table.cmp sup { color: #999; font-weight: 400; }
   label.inc { font-size: 12px; color: #555; margin-left: 10px; } label.inc input { vertical-align: middle; }
+  .outputs { margin: 14px 0 4px; padding-top: 10px; border-top: 1px solid #eee; }
+  .olabel { display: block; font-weight: 600; color: #555; font-size: 13px; margin-bottom: 6px; }
 </style></head><body>
 <h1>QScreen Filing Ingestor</h1>
 <p class="sub">Drop a QSE financial-report PDF, fill the fields, click Extract. Then download the report and upload it to qscreen.app. Type a known symbol and the sub-sector auto-fills.</p>
@@ -338,11 +341,15 @@ f.onsubmit = async (e) => {
       lastName = data.filename; lastFiling = data.filing;
       lastSymbol = (data.filing && data.filing.metadata && data.filing.metadata.symbol) || '';
       lastAnalysis = data.analysis || null;
-      html += '\\n\\n<a class="dl" id="dl" href="#">⬇ Download ' + data.filename + '</a>';
+      html += '\\n\\n<div class="outputs"><span class="olabel">Outputs — pick what you need:</span>';
+      html += '<a class="dl" id="dl" href="#">⬇ qscreen JSON</a>';
+      html += '<a class="dl" id="xlsx" href="#">⬇ Excel transcript</a>';
+      html += '<a class="dl" id="csv" href="#">⬇ CSV</a>';
       html += '<a class="dl" id="rep" href="#">📰 Analyst report</a>';
       if (UPLOAD_ENABLED && !data.problems.length)
         html += '<a class="dl up" id="up" href="#">⬆ Upload to qscreen.app</a>'
              + '<label class="inc"><input type="checkbox" id="incan"> include analysis in upload</label>';
+      html += '</div>';
       html += renderSegments((data.analysis||{}).segments);
       html += renderAnalysis(data.analysis);
       html += renderDcfPanel();
@@ -353,6 +360,21 @@ f.onsubmit = async (e) => {
         const a = document.createElement('a'); a.href = url; a.download = lastName; a.click();
         URL.revokeObjectURL(url);
       };
+      async function dlPost(path, fname){
+        const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+                                     body: JSON.stringify({ filing: lastFiling })});
+        if(!r.ok){ const d = await r.json().catch(()=>({})); throw new Error(d.error || ('HTTP '+r.status)); }
+        const url = URL.createObjectURL(await r.blob());
+        const a = document.createElement('a'); a.href = url; a.download = fname; a.click(); URL.revokeObjectURL(url);
+      }
+      const xl = document.getElementById('xlsx');
+      if (xl) xl.onclick = async (ev) => { ev.preventDefault(); const t = xl.textContent; xl.textContent = '⬇ Building…';
+        try { await dlPost('/workbook', (lastSymbol||'filing') + '_transcript.xlsx'); xl.textContent = t; }
+        catch(e){ xl.textContent = '⬇ Excel failed'; } };
+      const cv = document.getElementById('csv');
+      if (cv) cv.onclick = async (ev) => { ev.preventDefault();
+        try { await dlPost('/export.csv', (lastSymbol||'filing') + '_line_items.csv'); }
+        catch(e){ cv.textContent = '⬇ CSV failed'; } };
       const dg = document.getElementById('dcfgo');
       if (dg) dg.onclick = (ev) => { ev.preventDefault(); runDcf(); };
       const rp = document.getElementById('rep');
@@ -495,6 +517,43 @@ def extract():
         return {"error": str(e)}, 400
     except Exception as e:
         return {"error": str(e), "detail": traceback.format_exc()[-1500:]}, 500
+
+
+@app.route("/workbook", methods=["POST"])
+def workbook_route():
+    """Excel financial-transcript workbook for a filing (or several, for more
+    years). Body: {filing|filings}. Returns the .xlsx bytes as a download."""
+    payload = request.get_json(silent=True) or {}
+    filings = payload.get("filings")
+    if filings is None and isinstance(payload.get("filing"), dict):
+        filings = [payload["filing"]]
+    if not isinstance(filings, list) or not filings:
+        return {"error": "missing 'filings' (list) or 'filing' (object)"}, 400
+    try:
+        data = qscreen_workbook.workbook_bytes(filings[-1], filings)
+    except Exception as e:
+        return {"error": str(e)}, 400
+    sym = (filings[-1].get("metadata") or {}).get("symbol") or "filing"
+    return Response(data, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f'attachment; filename="{sym}_transcript.xlsx"'})
+
+
+@app.route("/export.csv", methods=["POST"])
+def export_csv_route():
+    """Flat line-items CSV for a filing. Body: {filing}. Returns text/csv."""
+    import csv
+    import io as _io
+    payload = request.get_json(silent=True) or {}
+    filing = payload.get("filing")
+    if not isinstance(filing, dict):
+        return {"error": "missing 'filing' object"}, 400
+    buf = _io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=engine.EXPORT_COLUMNS)
+    w.writeheader()
+    w.writerows(engine.flatten_line_items(filing))
+    sym = (filing.get("metadata") or {}).get("symbol") or "filing"
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{sym}_line_items.csv"'})
 
 
 @app.route("/analyze", methods=["POST"])

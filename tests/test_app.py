@@ -132,6 +132,36 @@ def test_dcf_route_missing(client):
     assert client.post("/dcf", json={}).status_code == 400
 
 
+def _statement_filing():
+    li = [{"account_code": c, "label_verbatim": c, "value": v,
+           "comparatives": [{"period_label": "2022", "value": v}]}
+          for c, v in [("IS_NET_INCOME", 15000), ("BS_TOTAL_EQUITY", 100000)]]
+    return {"metadata": {"symbol": "QNBK", "fiscal_year": 2023, "fiscal_period": "FY", "currency": "QAR"},
+            "statements": [{"type": "income_statement", "title": "IS", "period_label": "2023",
+                            "verbatim_text": "x", "line_items": li}]}
+
+
+def test_workbook_route_returns_xlsx(client):
+    r = client.post("/workbook", json={"filing": _statement_filing()})
+    assert r.status_code == 200
+    assert "spreadsheetml" in r.headers["Content-Type"]
+    assert r.data[:2] == b"PK" and len(r.data) > 2000              # a real .xlsx (zip)
+
+
+def test_workbook_route_missing(client):
+    assert client.post("/workbook", json={}).status_code == 400
+
+
+def test_export_csv_route(client):
+    r = client.post("/export.csv", json={"filing": _statement_filing()})
+    assert r.status_code == 200 and r.headers["Content-Type"].startswith("text/csv")
+    assert r.get_data(as_text=True).splitlines()[0].split(",")[0] == "statement_type"
+
+
+def test_export_csv_route_missing(client):
+    assert client.post("/export.csv", json={}).status_code == 400
+
+
 def _bank_filing(sym, ni, eq):
     li = [{"account_code": c, "label_verbatim": c, "value": v,
            "comparatives": [{"period_label": "2022", "value": v}]}
