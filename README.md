@@ -3,6 +3,8 @@
 Turn a PDF financial report into a QSE-format filing JSON — lossless, auditable, and ready to upload.
 Two modes: **local browser app** (drag-and-drop) or **one-command CLI**.
 
+> **First run?** Follow **[RUNBOOK.md](RUNBOOK.md)** — install → key → one command → every output.
+
 ## Install
 
 **Option 1 — installer script** (clones to `~/.qscreen-filing-tool`, installs deps, self-tests):
@@ -81,8 +83,11 @@ python3 qscreen_ingest.py <PDF_PATH> \
 - `--period`: `FY | Q1 | Q2 | Q3 | Q4 | H1 | 9M` (default `FY`)
 - `--provider` / `--model` — choose the LLM (see the table above; default auto-detect)
 - `--dry-run` — produce the JSON **without** uploading (inspect first)
-- `--export csv` — also write a flat line-items table; `--export xlsx` — also write the
-  **Excel financial-transcript workbook** (see below). Repeatable.
+- `--export csv|xlsx|html` — also write a flat line-items table, the **Excel transcript**
+  workbook, and/or the printable **statements document** (repeatable; see below)
+- `--analyze` — also save the analysis + valuation JSON; `--report [--price P --shares N]`
+  — also render the one-page **analyst report** (HTML + Markdown). Combine them to get
+  **every artifact from one command** (see [RUNBOOK.md](RUNBOOK.md))
 - `--ocr auto|never|always` — OCR scanned pages (`auto` only does near-empty pages; needs the `ocr` extra + system `tesseract`/`poppler`)
 - `--version` — print the tool version
 
