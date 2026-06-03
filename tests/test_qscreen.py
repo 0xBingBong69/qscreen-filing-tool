@@ -585,6 +585,48 @@ def test_flatten_includes_prior_columns():
     assert row["prior_period_label"] == "2022" and row["prior_value"] == 9
 
 
+# ── typed segments[] (contract) ──────────────────────────────────────────────
+
+def test_empty_filing_has_segments_list():
+    assert e.empty_filing()["segments"] == []
+
+
+def test_validate_accepts_valid_segment():
+    f = good_filing()
+    f["segments"] = [{"dimension": "geography", "name": "Turkey", "currency": "TRY",
+                      "metrics": {"revenue": 1}}]
+    assert e.validate_filing(f) == []
+
+
+def test_validate_rejects_bad_segment():
+    f = good_filing()
+    f["segments"] = [{"dimension": "planet", "name": "Mars"}]
+    assert any("dimension" in p for p in e.validate_filing(f))
+    f["segments"] = [{"dimension": "geography", "name": ""}]
+    assert any("name" in p for p in e.validate_filing(f))
+
+
+def test_normalize_coerces_segment_dimension_aliases():
+    d = {"metadata": {}, "audit": {}, "notes": [], "extraction_quality": {}, "statements": [],
+         "segments": [{"dimension": "Geographical", "name": "Egypt"},
+                      {"dimension": "operating segment", "name": "Retail"},
+                      {"dimension": "subsidiary", "name": "QNB Finansbank"},
+                      {"name": "no dimension"}]}
+    n = e.normalize_filing(d)
+    dims = [s["dimension"] for s in n["segments"]]
+    assert dims == ["geography", "business_line", "legal_entity", "business_line"]
+
+
+def test_merge_unions_segments_across_windows():
+    w1 = e.empty_filing(); w2 = e.empty_filing()
+    w1["segments"] = [{"dimension": "geography", "name": "Qatar", "period_label": "2023",
+                       "metrics": {"revenue": 100}}]
+    w2["segments"] = [{"dimension": "geography", "name": "Turkey", "period_label": "2023",
+                       "metrics": {"revenue": 50}, "verbatim_text": "Turkey segment ..."}]
+    seg = e.merge_filings([w1, w2])["segments"]
+    assert {s["name"] for s in seg} == {"Qatar", "Turkey"}
+
+
 # ── profile-aware prompting (Qatar context injection) ────────────────────────
 
 def test_qatar_context_empty_for_none():
@@ -607,7 +649,8 @@ def test_system_prompt_pre_acquisition_year_omits_segment():
 
 def test_system_prompt_without_profile_is_clean():
     sp = e._system_prompt("islamic_bank", False, None)
-    assert "QATAR ANALYST CONTEXT" not in sp
+    # The segments rule mentions the context by name, but no per-company block is injected.
+    assert "pre-loaded knowledge about THIS specific company" not in sp
 
 
 # ── self-test entrypoint still green ─────────────────────────────────────────

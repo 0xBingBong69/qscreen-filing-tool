@@ -127,6 +127,16 @@ python3 qscreen_series.py --symbol QNBK QNBK_2022_FY_filing.json QNBK_2023_FY_fi
 # → QNBK_series.json  (years, per-metric values, and any restatements flagged)
 ```
 
+### Segment breakdown (by business line, geography & currency)
+
+Extraction now also captures a typed `segments[]` section, and the analyzer
+(`qscreen_analyze.analyze_segments`) turns it into a per-dimension breakdown with
+year-on-year growth, share-of-total, **FX-exposure flags**, and **event
+annotations** from the profile — e.g. QNB's Turkey segment is flagged as TRY with
+"2016: Finansbank acquisition" and "2022: IAS 29 hyperinflation". The browser app
+renders this automatically after an extract, and there's a `POST /segments` route
+to re-analyze any filing JSON.
+
 ## Testing
 
 ```bash

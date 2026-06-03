@@ -29,6 +29,7 @@ from pathlib import Path
 
 # Reuse the exact, tested engine — do NOT reimplement any of it here.
 import qscreen_ingest as engine
+import qscreen_analyze
 
 try:
     from flask import Flask, request, Response, send_file
@@ -78,6 +79,14 @@ PAGE = """<!doctype html>
   details.adv { margin-top: 14px; } summary { cursor: pointer; color: #06c; font-weight: 600; }
   .keyhint { background: #eef6ff; border: 1px solid #cfe3ff; border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 13px; line-height: 1.5; }
   .keyhint a { color: #06c; font-weight: 700; } .keyhint code { background: #dceaff; padding: 1px 5px; border-radius: 4px; }
+  .seg { margin-top: 18px; } .seg h3 { font-size: 16px; margin: 8px 0; } .seg h4 { font-size: 13px; color: #555; text-transform: capitalize; margin: 12px 0 4px; }
+  table.seg { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.seg th, table.seg td { border-bottom: 1px solid #eee; padding: 5px 8px; text-align: right; }
+  table.seg th:first-child, table.seg td:first-child { text-align: left; }
+  table.seg th { color: #888; font-weight: 600; }
+  .fx { background: #fde8c8; color: #a05a00; border-radius: 4px; padding: 0 5px; font-size: 11px; font-weight: 700; }
+  .ev { color: #06c; cursor: help; }
+  .neg { color: #c33; } .pos { color: #0a7; }
 </style></head><body>
 <h1>QScreen Filing Ingestor</h1>
 <p class="sub">Drop a QSE financial-report PDF, fill the fields, click Extract. Then download the report and upload it to qscreen.app. Type a known symbol and the sub-sector auto-fills.</p>
@@ -143,6 +152,27 @@ function updateProvider() {
   }
 }
 if (provEl) { provEl.addEventListener('change', updateProvider); updateProvider(); }
+
+function fmtNum(x){ return (x==null)?'—':Number(x).toLocaleString(); }
+function fmtPct(x){ if(x==null) return '<span>—</span>'; const c=x<0?'neg':'pos'; return '<span class="'+c+'">'+(x*100).toFixed(0)+'%</span>'; }
+function renderSegments(sa){
+  if(!sa || !sa.dimensions || !Object.keys(sa.dimensions).length) return '';
+  let h = '<div class="seg"><h3>Segment breakdown ('+(sa.reporting_currency||'')+')</h3>';
+  for(const dim of Object.keys(sa.dimensions)){
+    const d = sa.dimensions[dim];
+    h += '<h4>by '+dim.replace('_',' ')+'</h4><table class="seg"><tr><th>Segment</th>'
+       + '<th>Revenue</th><th>YoY</th><th>Share</th><th>Net profit</th><th>YoY</th></tr>';
+    for(const r of d.segments){
+      const m=r.metrics||{}, y=r.yoy||{}, s=r.share||{};
+      const fx = r.fx_exposed ? ' <span class="fx" title="'+(r.fx_note||'')+'">FX '+(r.currency||'')+'</span>' : '';
+      const ev = (r.events&&r.events.length) ? ' <span class="ev" title="'+r.events.join(' · ')+'">ⓘ</span>' : '';
+      h += '<tr><td>'+r.name+fx+ev+'</td><td>'+fmtNum(m.revenue)+'</td><td>'+fmtPct(y.revenue)
+         + '</td><td>'+fmtPct(s.revenue)+'</td><td>'+fmtNum(m.net_profit)+'</td><td>'+fmtPct(y.net_profit)+'</td></tr>';
+    }
+    h += '</table>';
+  }
+  return h + '</div>';
+}
 const symbolEl = document.getElementById('symbol'), subEl = document.getElementById('subsector'), hintEl = document.getElementById('hint');
 symbolEl.addEventListener('input', () => {
   const sym = symbolEl.value.trim().toUpperCase().replace(/\\.QA$/, '');
@@ -171,6 +201,7 @@ f.onsubmit = async (e) => {
       html += '\\n\\n<a class="dl" id="dl" href="#">⬇ Download ' + data.filename + '</a>';
       if (UPLOAD_ENABLED && !data.problems.length)
         html += '<a class="dl up" id="up" href="#">⬆ Upload to qscreen.app</a>';
+      html += renderSegments(data.segments_analysis);
       out.innerHTML = html;
       document.getElementById('dl').onclick = (ev) => {
         ev.preventDefault();
@@ -270,8 +301,10 @@ def extract():
             "extractor": {"provider": cfg["name"], "model": cfg["model"]},
         })
         problems = engine.validate_filing(filing)
+        seg_analysis = qscreen_analyze.analyze_segments(filing, args._profile)
+        nseg = len(filing.get("segments", []))
         summary = (f"Extracted {len(filing.get('statements', []))} statements, "
-                   f"{len(filing.get('notes', []))} notes, "
+                   f"{nseg} segments, {len(filing.get('notes', []))} notes, "
                    f"audit={filing.get('audit', {}).get('opinion_type')}.")
         if problems:
             summary += f" ({len(problems)} note(s) below — review before uploading.)"
@@ -282,12 +315,27 @@ def extract():
             "summary": summary,
             "problems": problems,
             "filing": filing,
+            "segments_analysis": seg_analysis,
             "filename": f"{symbol}_{year}_{period}_filing.json",
         }
     except SystemExit as e:                       # provider/key/model config errors
         return {"error": str(e)}, 400
     except Exception as e:
         return {"error": str(e), "detail": traceback.format_exc()[-1500:]}, 500
+
+
+@app.route("/segments", methods=["POST"])
+def segments():
+    """Re-run the segment breakdown for a filing JSON (uses the Qatar profile
+    for FX/event annotations when the symbol+year resolve)."""
+    payload = request.get_json(silent=True) or {}
+    filing = payload.get("filing")
+    if not isinstance(filing, dict):
+        return {"error": "missing 'filing' object"}, 400
+    meta = filing.get("metadata") or {}
+    profile = qatar.profile_for_year(meta.get("symbol") or payload.get("symbol") or "",
+                                     meta.get("fiscal_year") or payload.get("year"))
+    return qscreen_analyze.analyze_segments(filing, profile)
 
 
 @app.route("/upload", methods=["POST"])

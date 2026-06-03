@@ -111,6 +111,7 @@ NOTE_CATEGORIES = {
 
 FISCAL_PERIODS = {"FY", "Q1", "Q2", "Q3", "Q4", "H1", "9M"}
 SECTORS = ["conventional_bank", "islamic_bank", "industrial", "insurance", "other"]
+SEGMENT_DIMENSIONS = {"business_line", "geography", "legal_entity"}
 
 
 def empty_filing() -> dict:
@@ -130,6 +131,7 @@ def empty_filing() -> dict:
             "verbatim_text": "",
         },
         "statements": [],
+        "segments": [],
         "notes": [],
         "extraction_quality": {"confidence": None, "warnings": [], "unmapped_labels": []},
     }
@@ -187,6 +189,22 @@ def validate_filing(data: dict) -> list[str]:
                             if not isinstance(comp, dict) or not comp.get("period_label"):
                                 problems.append(
                                     f"statements[{i}].line_items[{j}].comparatives[{c}]: need period_label")
+
+    # segments[] is an optional, additive section (absent or [] is fine).
+    segments = data.get("segments")
+    if segments is not None and not isinstance(segments, list):
+        problems.append("segments: must be a list")
+    elif isinstance(segments, list):
+        for i, sg in enumerate(segments):
+            if not isinstance(sg, dict):
+                problems.append(f"segments[{i}]: not an object")
+                continue
+            if sg.get("dimension") not in SEGMENT_DIMENSIONS:
+                problems.append(f"segments[{i}].dimension: invalid {sg.get('dimension')!r}")
+            if not sg.get("name"):
+                problems.append(f"segments[{i}].name: empty")
+            if sg.get("metrics") is not None and not isinstance(sg.get("metrics"), dict):
+                problems.append(f"segments[{i}].metrics: must be an object")
 
     notes = data.get("notes")
     if not isinstance(notes, list):
@@ -476,7 +494,7 @@ prints (e.g. rental income, occupancy, ARPU, freight/charter revenue, share of \
 results of associates).{_qatar_context(profile)}
 
 OUTPUT CONTRACT — emit ONE JSON object with EXACTLY these top-level keys:
-  metadata, audit, statements, notes, extraction_quality
+  metadata, audit, statements, segments, notes, extraction_quality
 Use these EXACT field names (do not rename):
   metadata: {{symbol, company_name, sector, fiscal_year, fiscal_period, \
 period_end, currency, unit_scale, reporting_framework, consolidated, language}}
@@ -486,6 +504,10 @@ material_uncertainty_going_concern ({{present, text}} or null), verbatim_text}}
   statements[]: {{type, title, period_label, verbatim_text, line_items[]}}
   line_items[]: {{account_code, label_verbatim, value, comparatives (array of \
 {{period_label, value}}), note_ref, depth, is_subtotal}}
+  segments[]: {{dimension ("business_line"|"geography"|"legal_entity"), name, \
+currency, period_label, metrics ({{revenue, profit_before_tax, net_profit, \
+total_assets, ...}}), comparatives (array of {{period_label, metrics}}), note_ref, \
+verbatim_text}}
   notes[]: {{number, title, category, structured, verbatim_text}}
 
 RULES (in priority order):
@@ -511,6 +533,13 @@ audit matter is {{title, text}} — no other keys.
 verbatim_text. Watch for: contingent liabilities, commitments, other \
 comprehensive income, cost/expense breakdowns, related-party, ECL/staged \
 provisions, and Islamic profit-sharing/sukuk/quasi-equity.
+4b. SEGMENTS. If the filing discloses operating-segment, business-line, or \
+geographic/country breakdowns (usually a "segment information" note), ALSO emit \
+them as typed `segments[]` rows — one per segment per dimension — putting each \
+segment's revenue / profit / assets in `metrics` and its prior-year figures in \
+`comparatives`. Set `currency` when a segment reports in a foreign currency. The \
+QATAR ANALYST CONTEXT lists the segments to expect for this company; capture what \
+the filing ACTUALLY shows. Keep the full note text in notes[] as well (lossless).
 5. HONESTY. If a value is illegible or absent, use null and add a string to \
 extraction_quality.warnings. Set extraction_quality.confidence in [0,1].
 
@@ -668,6 +697,24 @@ _META_ALIASES = {
 _UNIT_WORDS = {"thousand": 1000, "thousands": 1000, "million": 1000000, "millions": 1000000}
 
 
+_DIMENSION_ALIASES = {
+    "business": "business_line", "operating": "business_line", "operating_segment": "business_line",
+    "segment": "business_line", "division": "business_line", "activity": "business_line",
+    "geographic": "geography", "geographical": "geography", "country": "geography",
+    "region": "geography", "location": "geography",
+    "entity": "legal_entity", "subsidiary": "legal_entity", "company": "legal_entity",
+}
+
+
+def _normalize_dimension(val):
+    if not val:
+        return "business_line"
+    s = str(val).strip().lower().replace(" ", "_").replace("-", "_")
+    if s in SEGMENT_DIMENSIONS:
+        return s
+    return _DIMENSION_ALIASES.get(s, "business_line")
+
+
 def _normalize_sector(val):
     if not val:
         return None
@@ -770,6 +817,15 @@ def normalize_filing(d: dict) -> dict:
         eq.setdefault("unmapped_labels", [])
         eq["unmapped_labels"].extend(unmapped)
 
+    norm_segments = []
+    for sg in d.get("segments") or []:
+        if not (isinstance(sg, dict) and sg.get("name")):
+            continue
+        sg = dict(sg)
+        sg["dimension"] = _normalize_dimension(sg.get("dimension"))
+        norm_segments.append(sg)
+    d["segments"] = norm_segments
+
     if not isinstance(d.get("notes"), list):
         d["notes"] = []
     if not isinstance(d.get("extraction_quality"), dict):
@@ -867,6 +923,20 @@ def merge_filings(parts: list[dict]) -> dict:
                 continue
             by_type.setdefault(t, []).append(st)
     merged["statements"] = [_merge_statement_group(t, g) for t, g in by_type.items()]
+
+    # Union segments across windows; the richest copy of each (dimension, name,
+    # period) wins so a segment note split across a window boundary isn't lost.
+    by_seg: dict[tuple, tuple] = {}
+    for part in parts:
+        for sg in part.get("segments") or []:
+            if not (isinstance(sg, dict) and sg.get("name")):
+                continue
+            key = (sg.get("dimension"), " ".join(str(sg["name"]).split()).lower(),
+                   sg.get("period_label"))
+            score = (len(sg.get("metrics") or {}), len(sg.get("verbatim_text") or ""))
+            if key not in by_seg or score > by_seg[key][0]:
+                by_seg[key] = (score, sg)
+    merged["segments"] = [v[1] for v in by_seg.values()]
 
     by_note: dict[str, dict] = {}
     for part in parts:

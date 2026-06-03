@@ -86,6 +86,20 @@ def test_upload_posts_clean_filing(client, monkeypatch):
     assert captured["token"] == "tok"
 
 
+def test_segments_route_analyzes_filing(client):
+    filing = {"metadata": {"symbol": "QNBK", "fiscal_year": 2023, "currency": "QAR"},
+              "segments": [{"dimension": "geography", "name": "Turkey", "metrics": {"revenue": 50},
+                            "comparatives": [{"period_label": "2022", "metrics": {"revenue": 70}}]}]}
+    r = client.post("/segments", json={"filing": filing})
+    assert r.status_code == 200
+    turkey = r.get_json()["dimensions"]["geography"]["segments"][0]
+    assert turkey["name"] == "Turkey" and turkey["fx_exposed"] and turkey["currency"] == "TRY"
+
+
+def test_segments_route_missing_filing(client):
+    assert client.post("/segments", json={}).status_code == 400
+
+
 def test_subsector_taxonomy_maps_to_valid_categories():
     # Every sub-sector the UI offers must map to one of the engine's 5 sectors.
     for sub, cat in app_mod.SUBSECTOR_TO_EXTRACTION.items():
