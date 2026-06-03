@@ -11,8 +11,10 @@ qscreen.app. Nothing is auto-uploaded — you stay in control.
     python3 qscreen_app.py
     # then open http://127.0.0.1:8765 in your browser
 
-The OpenRouter key is read from scripts/.env (same as the CLI) or the
-OPENROUTER_API_KEY env var. No agent, no command line per filing.
+The OpenRouter key is read from the tool's .env (same as the CLI) or the
+OPENROUTER_API_KEY env var. No agent, no command line per filing. Upload is
+opt-in: a button appears only when the server has INGEST_TOKEN set, and even
+then nothing leaves your machine until you click it.
 """
 from __future__ import annotations
 
@@ -384,6 +386,12 @@ def upload():
         return {"error": str(e)}, 502
 
 
+def main() -> None:
+    host = os.getenv("QSCREEN_APP_HOST", "127.0.0.1")
+    port = int(os.getenv("QSCREEN_APP_PORT", "8765"))
+    print(f"\n  QScreen Filing Ingestor — open  http://{host}:{port}  in your browser\n")
+    app.run(host=host, port=port, debug=False)
+
+
 if __name__ == "__main__":
-    print("\n  QScreen Filing Ingestor — open  http://127.0.0.1:8765  in your browser\n")
-    app.run(host="127.0.0.1", port=8765, debug=False)
+    main()
