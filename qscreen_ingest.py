@@ -1142,6 +1142,68 @@ def save_json(filing: dict, args) -> str:
     return out
 
 
+def write_outputs(filing: dict, args) -> tuple[list[str], dict | None]:
+    """Write the opt-in local artifacts for a freshly-extracted filing — exports
+    (csv/xlsx/html), analysis/valuation JSON, and the analyst report. Pure file I/O
+    with no network, so it is unit-testable offline. Optional steps never raise
+    (a failure is surfaced but cannot sink a good extraction). Returns
+    (files_written, analysis_artifacts)."""
+    base = f"{args.symbol.upper()}_{args.year}_{args.period}"
+    written: list[str] = []
+
+    for fmt in (getattr(args, "export", None) or []):
+        if fmt == "csv":
+            out = f"{base}_filing.csv"
+            print(f"📑 Exported {export_csv(filing, out)} line item(s) → {out}")
+        elif fmt == "xlsx":
+            out = f"{base}_filing.xlsx"           # the multi-sheet workbook transcript
+            import qscreen_workbook
+            qscreen_workbook.save_workbook(filing, out)
+            print(f"📑 Exported Excel transcript → {out}")
+        else:                                    # html → printable statements document
+            out = f"{base}_statements.html"
+            import qscreen_statements
+            qscreen_statements.save_statements_html(filing, out)
+            print(f"📄 Exported statements document → {out}")
+        written.append(out)
+
+    # Optionally also persist the derived analysis/valuation locally.
+    artifacts = None
+    if getattr(args, "analyze", False) or getattr(args, "with_analysis", False):
+        try:
+            artifacts = build_analysis_artifacts(filing, args)
+        except Exception as e:
+            print(f"   ⚠️  analysis step failed (extraction is unaffected): {e}")
+    if getattr(args, "analyze", False) and artifacts:
+        if artifacts.get("analysis"):
+            p = f"{base}_analysis.json"
+            Path(p).write_text(json.dumps(artifacts["analysis"], indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"🧮 Saved analysis → {p} ({len(artifacts['analysis'].get('red_flags', []))} red flag(s))")
+            written.append(p)
+        if (artifacts.get("valuation") or {}).get("valuation"):
+            p = f"{base}_valuation.json"
+            Path(p).write_text(json.dumps(artifacts["valuation"], indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"💰 Saved valuation → {p} ({artifacts['valuation']['valuation']['model']})")
+            written.append(p)
+
+    # Optionally also render the one-page analyst report (HTML + Markdown).
+    if getattr(args, "report", False):
+        try:
+            import qscreen_report
+            rep = qscreen_report.build_report(
+                args.symbol.upper(), [filing], getattr(args, "_profile", None),
+                price=getattr(args, "price", None), shares=getattr(args, "shares", None))
+            for ext, content in (("html", rep["html"]), ("md", rep["markdown"])):
+                p = f"{base}_report.{ext}"
+                Path(p).write_text(content, encoding="utf-8")
+                written.append(p)
+            print(f"📰 Analyst report → {base}_report.html (+ .md)")
+        except Exception as e:
+            print(f"   ⚠️  report step failed (extraction is unaffected): {e}")
+
+    return written, artifacts
+
+
 def run_filing(args) -> int:
     """Extract one PDF → save (+ optional export) → optionally upload. Returns
     an exit code: 0 ok, 2 saved-but-non-conforming (not uploaded)."""
@@ -1177,42 +1239,7 @@ def run_filing(args) -> int:
         print("   (saved for inspection; NOT uploading a non-conforming extract)")
 
     save_json(filing, args)
-    for fmt in (getattr(args, "export", None) or []):
-        base = f"{args.symbol.upper()}_{args.year}_{args.period}"
-        if fmt == "csv":
-            out = f"{base}_filing.csv"
-            print(f"📑 Exported {export_csv(filing, out)} line item(s) → {out}")
-        elif fmt == "xlsx":
-            out = f"{base}_filing.xlsx"           # the multi-sheet workbook transcript
-            import qscreen_workbook
-            qscreen_workbook.save_workbook(filing, out)
-            print(f"📑 Exported Excel transcript → {out}")
-        else:                                    # html → printable statements document
-            out = f"{base}_statements.html"
-            import qscreen_statements
-            qscreen_statements.save_statements_html(filing, out)
-            print(f"📄 Exported statements document → {out}")
-
-    # Both outputs: optionally also persist the derived analysis/valuation locally.
-    # A failure here must never sink a successful extraction — but it IS surfaced.
-    artifacts = None
-    if getattr(args, "analyze", False) or getattr(args, "with_analysis", False):
-        try:
-            artifacts = build_analysis_artifacts(filing, args)
-        except Exception as e:
-            print(f"   ⚠️  analysis step failed (extraction is unaffected): {e}")
-    if getattr(args, "analyze", False) and artifacts:
-        base = f"{args.symbol.upper()}_{args.year}_{args.period}"
-        if artifacts.get("analysis"):
-            Path(f"{base}_analysis.json").write_text(
-                json.dumps(artifacts["analysis"], indent=2, ensure_ascii=False), encoding="utf-8")
-            print(f"🧮 Saved analysis → {base}_analysis.json "
-                  f"({len(artifacts['analysis'].get('red_flags', []))} red flag(s))")
-        if (artifacts.get("valuation") or {}).get("valuation"):
-            Path(f"{base}_valuation.json").write_text(
-                json.dumps(artifacts["valuation"], indent=2, ensure_ascii=False), encoding="utf-8")
-            print(f"💰 Saved valuation → {base}_valuation.json "
-                  f"({artifacts['valuation']['valuation']['model']})")
+    _written, artifacts = write_outputs(filing, args)
 
     if problems:
         print("❌ Not uploading — fix extraction problems above first.")
@@ -1308,6 +1335,10 @@ def main() -> int:
                    help="Also compute and save <symbol>_<year>_<period>_analysis.json + _valuation.json")
     p.add_argument("--with-analysis", action="store_true",
                    help="Fold the derived analysis into the qscreen.app upload payload (additive)")
+    p.add_argument("--report", action="store_true",
+                   help="Also render the one-page analyst report → <symbol>_<year>_<period>_report.html (+ .md)")
+    p.add_argument("--price", type=float, default=None, help="Share price, for the report's valuation upside")
+    p.add_argument("--shares", type=float, default=None, help="Shares outstanding, for per-share valuation")
     p.add_argument("--manifest", help="Batch mode: CSV with columns pdf,symbol,sector,year[,period]")
     p.add_argument("--llm-key", default=None,
                    help="API key (else read from the provider's env var, e.g. MINIMAX_API_KEY)")
