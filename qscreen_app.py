@@ -167,6 +167,8 @@ PAGE = """<!doctype html>
   a.up { background: #0b6; } a.up.busy { background: #999; pointer-events: none; }
   .muted { color: #888; font-weight: 400; font-size: 12px; }
   details.adv { margin-top: 14px; } summary { cursor: pointer; color: #06c; font-weight: 600; }
+  .keyhint { background: #eef6ff; border: 1px solid #cfe3ff; border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 13px; line-height: 1.5; }
+  .keyhint a { color: #06c; font-weight: 700; } .keyhint code { background: #dceaff; padding: 1px 5px; border-radius: 4px; }
 </style></head><body>
 <h1>QScreen Filing Ingestor</h1>
 <p class="sub">Drop a QSE financial-report PDF, fill the fields, click Extract. Then download the report and upload it to qscreen.app. Type a known symbol and the sub-sector auto-fills.</p>
@@ -191,23 +193,22 @@ PAGE = """<!doctype html>
       </select>
     </div>
   </div>
-  <details class="adv"><summary>Advanced — provider / model</summary>
+  <details class="adv" open><summary>Provider / model — need an API key? open this</summary>
     <div class="row">
-      <div><label>Provider</label>
+      <div><label>AI Provider</label>
         <select name="provider" id="provider">
-          <option value="">auto (server's configured key)</option>
-          <option value="minimax">minimax</option>
-          <option value="openrouter">openrouter</option>
-          <option value="kimi">kimi</option>
-          <option value="openai">openai</option>
-          <option value="anthropic">claude (anthropic)</option>
+          <option value="">auto (use whichever key is set)</option>
+          <option value="minimax">MiniMax</option>
+          <option value="openrouter">OpenRouter</option>
+          <option value="kimi">Kimi (Moonshot)</option>
+          <option value="openai">OpenAI</option>
+          <option value="anthropic">Claude (Anthropic)</option>
         </select>
       </div>
       <div><label>Model <span class="muted">(blank = provider default)</span></label>
         <input name="model" id="model" placeholder="default" autocomplete="off"></div>
     </div>
-    <p class="muted">Set the matching key in the tool's <code>.env</code>
-      (MINIMAX_API_KEY, OPENROUTER_API_KEY, MOONSHOT_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY).</p>
+    <p class="keyhint" id="provkey"></p>
   </details>
   <button type="submit" id="go">Extract</button>
 </form>
@@ -215,12 +216,24 @@ PAGE = """<!doctype html>
 <script>
 const SYMBOL_SUBSECTOR = __SYMBOL_MAP_JSON__;
 const UPLOAD_ENABLED = __UPLOAD_ENABLED__;
-const PROVIDER_MODELS = __PROVIDER_MODELS_JSON__;
+const PROVIDER_INFO = __PROVIDER_INFO_JSON__;
 const f = document.getElementById('f'), out = document.getElementById('out'), go = document.getElementById('go');
-const provEl = document.getElementById('provider'), modelEl = document.getElementById('model');
-if (provEl) provEl.addEventListener('change', () => {
-  modelEl.placeholder = PROVIDER_MODELS[provEl.value] || 'default';
-});
+const provEl = document.getElementById('provider'), modelEl = document.getElementById('model'),
+      provKey = document.getElementById('provkey');
+function updateProvider() {
+  const info = PROVIDER_INFO[provEl.value];
+  if (info) {
+    modelEl.placeholder = info.model || 'default';
+    provKey.innerHTML = '🔑 Need a key for <b>' + info.label + '</b>? ' +
+      '<a href="' + info.url + '" target="_blank" rel="noopener">Click here to get one &#8599;</a>' +
+      ', then add <code>' + info.env + '=your-key</code> to the <code>.env</code> file next to the app and restart it.';
+  } else {
+    modelEl.placeholder = 'default';
+    provKey.innerHTML = '🔑 You need ONE provider API key. Pick a provider above to get a sign-up link, ' +
+      'then add it to the <code>.env</code> file next to the app (e.g. <code>MINIMAX_API_KEY=your-key</code>) and restart it.';
+  }
+}
+if (provEl) { provEl.addEventListener('change', updateProvider); updateProvider(); }
 const symbolEl = document.getElementById('symbol'), subEl = document.getElementById('subsector'), hintEl = document.getElementById('hint');
 symbolEl.addEventListener('input', () => {
   const sym = symbolEl.value.trim().toUpperCase().replace(/\\.QA$/, '');
@@ -289,11 +302,13 @@ f.onsubmit = async (e) => {
 @app.route("/")
 def index():
     upload_enabled = bool(os.getenv("INGEST_TOKEN"))
-    provider_models = {name: cfg["default_model"] for name, cfg in engine.PROVIDERS.items()}
+    provider_info = {name: {"label": cfg["label"], "model": cfg["default_model"],
+                            "url": cfg["key_url"], "env": cfg["env"][0]}
+                     for name, cfg in engine.PROVIDERS.items()}
     html = (PAGE
             .replace("__SUBSECTOR_OPTIONS__", _subsector_options_html())
             .replace("__SYMBOL_MAP_JSON__", json.dumps(SYMBOL_SUBSECTOR))
-            .replace("__PROVIDER_MODELS_JSON__", json.dumps(provider_models))
+            .replace("__PROVIDER_INFO_JSON__", json.dumps(provider_info))
             .replace("__UPLOAD_ENABLED__", "true" if upload_enabled else "false"))
     return Response(html, mimetype="text/html")
 

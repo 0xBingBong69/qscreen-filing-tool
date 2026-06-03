@@ -195,16 +195,21 @@ def validate_filing(data: dict) -> list[str]:
 # adding a row here — nothing else needs to change. Override any field per-run
 # with --base-url / --model / --llm-key (or env QSCREEN_MODEL).
 PROVIDERS = {
-    "minimax":    {"base_url": "https://api.minimax.io/v1",   "kind": "openai",
-                   "env": ("MINIMAX_API_KEY",),               "default_model": "MiniMax-M2"},
-    "openrouter": {"base_url": "https://openrouter.ai/api/v1", "kind": "openai",
-                   "env": ("OPENROUTER_API_KEY",),            "default_model": "minimax/minimax-01"},
-    "kimi":       {"base_url": "https://api.moonshot.cn/v1",  "kind": "openai",
-                   "env": ("MOONSHOT_API_KEY", "KIMI_API_KEY"), "default_model": "kimi-k2-0905-preview"},
-    "openai":     {"base_url": "https://api.openai.com/v1",   "kind": "openai",
-                   "env": ("OPENAI_API_KEY",),                "default_model": "gpt-4o"},
-    "anthropic":  {"base_url": "https://api.anthropic.com/v1", "kind": "anthropic",
-                   "env": ("ANTHROPIC_API_KEY",),             "default_model": "claude-sonnet-4-5"},
+    "minimax":    {"label": "MiniMax", "base_url": "https://api.minimax.io/v1", "kind": "openai",
+                   "env": ("MINIMAX_API_KEY",), "default_model": "MiniMax-M2",
+                   "key_url": "https://platform.minimax.io/"},
+    "openrouter": {"label": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "kind": "openai",
+                   "env": ("OPENROUTER_API_KEY",), "default_model": "minimax/minimax-01",
+                   "key_url": "https://openrouter.ai/keys"},
+    "kimi":       {"label": "Kimi (Moonshot)", "base_url": "https://api.moonshot.ai/v1", "kind": "openai",
+                   "env": ("MOONSHOT_API_KEY", "KIMI_API_KEY"), "default_model": "kimi-k2-0905-preview",
+                   "key_url": "https://platform.moonshot.ai/console/api-keys"},
+    "openai":     {"label": "OpenAI", "base_url": "https://api.openai.com/v1", "kind": "openai",
+                   "env": ("OPENAI_API_KEY",), "default_model": "gpt-4o",
+                   "key_url": "https://platform.openai.com/api-keys"},
+    "anthropic":  {"label": "Claude (Anthropic)", "base_url": "https://api.anthropic.com/v1", "kind": "anthropic",
+                   "env": ("ANTHROPIC_API_KEY",), "default_model": "claude-sonnet-4-5",
+                   "key_url": "https://console.anthropic.com/settings/keys"},
 }
 # Friendly aliases the user can type for --provider / QSCREEN_PROVIDER.
 PROVIDER_ALIASES = {"claude": "anthropic", "moonshot": "kimi", "gpt": "openai", "oai": "openai"}
@@ -225,13 +230,15 @@ def default_model(name: str | None) -> str | None:
 
 
 def list_providers() -> str:
-    rows = ["Providers (set the matching API key in .env, then --provider <name>):"]
+    rows = ["Providers — put the matching API key in .env (the tool auto-detects it):", ""]
     for name, p in PROVIDERS.items():
-        rows.append(f"  {name:11s} {p['kind']:9s} key={'/'.join(p['env']):27s} model={p['default_model']}")
-    rows.append(f"  {'custom':11s} {'openai':9s} key={'LLM_API_KEY':27s} (also pass --base-url --model)")
+        rows.append(f"  {name:11s} {p['label']:18s} {p['env'][0]:20s} model={p['default_model']}")
+        rows.append(f"  {'':11s} └─ get a key:  {p['key_url']}")
+    rows.append(f"  {'custom':11s} {'(any OpenAI URL)':18s} {'LLM_API_KEY':20s} pass --base-url --model")
+    rows.append("")
     rows.append("Aliases: " + ", ".join(f"{a}→{b}" for a, b in PROVIDER_ALIASES.items()))
-    rows.append("Pick a model with --model or env QSCREEN_MODEL; pick a provider with "
-                "--provider or env QSCREEN_PROVIDER (else auto-detected from whichever key is set).")
+    rows.append("Force one with --provider NAME (or env QSCREEN_PROVIDER); pick a model with "
+                "--model (or env QSCREEN_MODEL).")
     return "\n".join(rows)
 
 

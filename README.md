@@ -34,14 +34,17 @@ QSCREEN_API_URL=https://qscreen.app # defaults to http://localhost:3004
 
 ### Choosing a provider / model
 
-| Provider | `--provider` | API key env | Default model |
-|----------|--------------|-------------|---------------|
-| MiniMax | `minimax` | `MINIMAX_API_KEY` | `MiniMax-M2` |
-| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | `minimax/minimax-01` |
-| Kimi (Moonshot) | `kimi` | `MOONSHOT_API_KEY` | `kimi-k2-0905-preview` |
-| OpenAI | `openai` | `OPENAI_API_KEY` | `gpt-4o` |
-| Claude (Anthropic) | `anthropic` / `claude` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-5` |
-| Any OpenAI-compatible URL | `custom` | `LLM_API_KEY` | *(pass `--model` + `--base-url`)* |
+| Provider | `--provider` | API key env | **Get a key (click)** | Default model |
+|----------|--------------|-------------|-----------------------|---------------|
+| **MiniMax** | `minimax` | `MINIMAX_API_KEY` | [platform.minimax.io](https://platform.minimax.io/) | `MiniMax-M2` |
+| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | [openrouter.ai/keys](https://openrouter.ai/keys) | `minimax/minimax-01` |
+| Kimi (Moonshot) | `kimi` | `MOONSHOT_API_KEY` | [platform.moonshot.ai](https://platform.moonshot.ai/console/api-keys) | `kimi-k2-0905-preview` |
+| OpenAI | `openai` | `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com/api-keys) | `gpt-4o` |
+| Claude (Anthropic) | `anthropic` / `claude` | `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com/settings/keys) | `claude-sonnet-4-5` |
+| Any OpenAI-compatible URL | `custom` | `LLM_API_KEY` | — | *(pass `--model` + `--base-url`)* |
+
+> Get an API key from the **Get a key** link, then paste it into `.env` as the
+> matching `*_API_KEY`. That's the whole setup.
 
 - **Auto-detect:** leave `--provider` off and the tool uses whichever key is set.
 - **Force a provider:** `--provider minimax` (or env `QSCREEN_PROVIDER=minimax`).

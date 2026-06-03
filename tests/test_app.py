@@ -32,7 +32,13 @@ def test_index_lists_all_providers(client):
     html = client.get("/").get_data(as_text=True)
     for v in ("minimax", "openrouter", "kimi", "openai", "anthropic"):
         assert f'value="{v}"' in html
-    assert "PROVIDER_MODELS = {" in html
+    assert "PROVIDER_INFO = {" in html
+    # the clickable key-signup links must be embedded for non-technical users
+    assert "platform.moonshot.ai/console/api-keys" in html   # global endpoint, not .cn
+    assert "console.anthropic.com/settings/keys" in html
+    assert "openrouter.ai/keys" in html
+    assert "platform.openai.com/api-keys" in html
+    assert "platform.minimax.io" in html
 
 
 def test_extract_requires_pdf(client):

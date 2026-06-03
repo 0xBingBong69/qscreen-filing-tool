@@ -398,6 +398,22 @@ def test_default_model_and_listing():
         assert name in txt
 
 
+def test_provider_base_urls_and_key_links():
+    # Verified against each provider's docs (June 2026). Kimi must be the GLOBAL
+    # endpoint — the .cn endpoint silently 401s international keys.
+    assert e.PROVIDERS["minimax"]["base_url"] == "https://api.minimax.io/v1"
+    assert e.PROVIDERS["kimi"]["base_url"] == "https://api.moonshot.ai/v1"
+    assert e.PROVIDERS["openrouter"]["base_url"] == "https://openrouter.ai/api/v1"
+    assert e.PROVIDERS["openai"]["base_url"] == "https://api.openai.com/v1"
+    assert e.PROVIDERS["anthropic"]["base_url"] == "https://api.anthropic.com/v1"
+    for name, p in e.PROVIDERS.items():
+        assert p["key_url"].startswith("https://"), name
+        assert p["label"], name
+    txt = e.list_providers()
+    assert "https://platform.moonshot.ai/console/api-keys" in txt
+    assert "https://console.anthropic.com/settings/keys" in txt
+
+
 def test_resolve_explicit_minimax(clean_provider_env):
     cfg = e.resolve_provider(_pargs(provider="minimax", llm_key="sk-mm"))
     assert cfg["name"] == "minimax" and cfg["kind"] == "openai"
