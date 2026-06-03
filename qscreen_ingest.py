@@ -61,6 +61,13 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+# Qatar per-stock knowledge base (optional import — the engine still runs without
+# it; when present it makes extraction company- and year-aware).
+try:
+    import qatar
+except Exception:  # pragma: no cover - defensive
+    qatar = None
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  CONTRACT  (the lossless filing schema — inlined so this file stands alone)
@@ -171,6 +178,15 @@ def validate_filing(data: dict) -> list[str]:
                     problems.append(f"statements[{i}].line_items[{j}].account_code: unknown {code!r}")
                 if not li.get("label_verbatim"):
                     problems.append(f"statements[{i}].line_items[{j}].label_verbatim: empty (lossy)")
+                comps = li.get("comparatives")
+                if comps is not None:
+                    if not isinstance(comps, list):
+                        problems.append(f"statements[{i}].line_items[{j}].comparatives: must be a list")
+                    else:
+                        for c, comp in enumerate(comps):
+                            if not isinstance(comp, dict) or not comp.get("period_label"):
+                                problems.append(
+                                    f"statements[{i}].line_items[{j}].comparatives[{c}]: need period_label")
 
     notes = data.get("notes")
     if not isinstance(notes, list):
@@ -400,7 +416,39 @@ def render_window(window: list[dict]) -> str:
 
 # ── Prompt ───────────────────────────────────────────────────────────────────
 
-def _system_prompt(sector: str, windowed: bool) -> str:
+def _qatar_context(pf: dict | None) -> str:
+    """Render a company-and-year specific context block from a resolved profile
+    (the output of qatar.profile_for_year). Empty string when no profile."""
+    if not pf:
+        return ""
+    seg = pf.get("segments_expected") or {}
+    geos = ", ".join(seg.get("by_geography") or []) or "—"
+    biz = ", ".join(seg.get("by_business") or []) or "—"
+    subs = "; ".join(f"{s['name']} ({s.get('country', '?')}/{s.get('currency', '?')})"
+                     for s in pf.get("active_subsidiaries") or []) or "none recorded"
+    evs = "; ".join(f"{e.get('year', '?')} {e.get('title', '')} — {e.get('effect', '')}"
+                    for e in pf.get("active_events") or []) or "none recorded"
+    kpis = ", ".join(pf.get("watch_kpis") or []) or "—"
+    quirks = "; ".join(pf.get("accounting_quirks") or []) or "—"
+    yr = pf.get("as_of_year")
+    return f"""
+
+QATAR ANALYST CONTEXT — pre-loaded knowledge about THIS specific company as of \
+fiscal year {yr}. Use it to know what to look for. If the filing differs from it \
+(a new acquisition, a disposal, a rename, or a regime change), capture what the \
+filing ACTUALLY shows and add a short note to extraction_quality.warnings.
+  Company (as of {yr}): {pf.get('name_as_of')} [{pf.get('ticker')}], \
+{pf.get('sub_sector')}; reports in {pf.get('reporting_currency')} under \
+{pf.get('framework_as_of')}.
+  Expected business segments: {biz}
+  Expected geographic segments: {geos}
+  Active foreign subsidiaries & currencies by {yr}: {subs}
+  Regulatory / accounting regime in force by {yr}: {evs}
+  KPIs to capture if the filing prints them: {kpis}
+  Known accounting quirks: {quirks}"""
+
+
+def _system_prompt(sector: str, windowed: bool, profile: dict | None = None) -> str:
     codes = ", ".join(sorted(KNOWN_ACCOUNT_CODES))
     statement_types = ", ".join(sorted(STATEMENT_TYPES))
     note_cats = ", ".join(sorted(NOTE_CATEGORIES))
@@ -425,7 +473,7 @@ revenue / cost of sales / inventory. For "other" (real estate, utilities, \
 telecom, transport, holding companies, services), DO NOT force a COGS/inventory \
 structure — capture whatever revenue and cost lines the statement actually \
 prints (e.g. rental income, occupancy, ARPU, freight/charter revenue, share of \
-results of associates).
+results of associates).{_qatar_context(profile)}
 
 OUTPUT CONTRACT — emit ONE JSON object with EXACTLY these top-level keys:
   metadata, audit, statements, notes, extraction_quality
@@ -436,7 +484,8 @@ period_end, currency, unit_scale, reporting_framework, consolidated, language}}
 of strings), key_audit_matters (array of {{title, text}}), \
 material_uncertainty_going_concern ({{present, text}} or null), verbatim_text}}
   statements[]: {{type, title, period_label, verbatim_text, line_items[]}}
-  line_items[]: {{account_code, label_verbatim, value, note_ref, depth, is_subtotal}}
+  line_items[]: {{account_code, label_verbatim, value, comparatives (array of \
+{{period_label, value}}), note_ref, depth, is_subtotal}}
   notes[]: {{number, title, category, structured, verbatim_text}}
 
 RULES (in priority order):
@@ -444,9 +493,13 @@ RULES (in priority order):
 original text into `verbatim_text`. Never summarize, truncate, or paraphrase. \
 This is the most important rule.
 2. STRUCTURED TOO. For each printed statement row emit a line_item. `value` is \
-the number exactly as printed (do NOT rescale); put the multiplier in \
-metadata.unit_scale (1, 1000, or 1000000) from the "in thousands/millions" \
+the CURRENT-period number exactly as printed (do NOT rescale); put the multiplier \
+in metadata.unit_scale (1, 1000, or 1000000) from the "in thousands/millions" \
 header. Use negative values for amounts printed in brackets.
+   - COMPARATIVES: QSE statements print the prior period beside the current one. \
+Capture each prior figure in `comparatives` as [{{"period_label": "2022", \
+"value": 123}}] (newest prior first; same sign and scale as `value`). Omit or use \
+[] only when the row genuinely prints no comparative.
    - account_code MUST be one of these canonical codes, or null if no clean \
 match (when null, still keep label_verbatim): {codes}
    - statements[].type MUST be one of: {statement_types}
@@ -476,7 +529,8 @@ Known metadata (trust these over anything parsed):
 FILING TEXT (page-delimited):
 {filing_text}"""
     return [
-        {"role": "system", "content": _system_prompt(args.sector, windowed)},
+        {"role": "system",
+         "content": _system_prompt(args.sector, windowed, getattr(args, "_profile", None))},
         {"role": "user", "content": user},
     ]
 
@@ -696,6 +750,13 @@ def normalize_filing(d: dict) -> dict:
             if code is not None and code not in KNOWN_ACCOUNT_CODES:
                 unmapped.append(f"{code} → {li.get('label_verbatim')}")
                 li["account_code"] = None
+            # Fold common prior-year aliases into the canonical `comparatives` list.
+            if not li.get("comparatives"):
+                pv = li.get("prior_value", li.get("previous_value", li.get("prior_year_value")))
+                if pv is not None:
+                    pl = (li.get("prior_period_label") or li.get("previous_period_label")
+                          or li.get("prior_year") or "prior")
+                    li["comparatives"] = [{"period_label": str(pl), "value": pv}]
             clean_items.append(li)
         st["line_items"] = clean_items
         norm_statements.append(st)
@@ -748,6 +809,8 @@ def _merge_statement_group(stype: str, group: list[dict]) -> dict:
                 kept = items[seen[key]]           # but upgrade a null code if a
                 if not kept.get("account_code") and li.get("account_code"):
                     kept["account_code"] = li["account_code"]  # later copy mapped it
+                if not kept.get("comparatives") and li.get("comparatives"):
+                    kept["comparatives"] = li["comparatives"]  # or recovered comparatives
                 continue
             seen[key] = len(items)
             items.append(dict(li))
@@ -926,13 +989,16 @@ def run_self_test() -> int:
 # ── Exports (flattened line-items table for human review) ────────────────────
 
 EXPORT_COLUMNS = ["statement_type", "statement_title", "period_label", "account_code",
-                  "label_verbatim", "value", "note_ref", "depth", "is_subtotal"]
+                  "label_verbatim", "value", "prior_period_label", "prior_value",
+                  "note_ref", "depth", "is_subtotal"]
 
 
 def flatten_line_items(filing: dict) -> list[dict]:
     rows: list[dict] = []
     for st in filing.get("statements") or []:
         for li in st.get("line_items") or []:
+            comps = li.get("comparatives") or []
+            prior = comps[0] if comps and isinstance(comps[0], dict) else {}
             rows.append({
                 "statement_type": st.get("type"),
                 "statement_title": st.get("title"),
@@ -940,6 +1006,8 @@ def flatten_line_items(filing: dict) -> list[dict]:
                 "account_code": li.get("account_code"),
                 "label_verbatim": li.get("label_verbatim"),
                 "value": li.get("value"),
+                "prior_period_label": prior.get("period_label"),
+                "prior_value": prior.get("value"),
                 "note_ref": li.get("note_ref"),
                 "depth": li.get("depth"),
                 "is_subtotal": li.get("is_subtotal"),
@@ -986,6 +1054,12 @@ def run_filing(args) -> int:
     """Extract one PDF → save (+ optional export) → optionally upload. Returns
     an exit code: 0 ok, 2 saved-but-non-conforming (not uploaded)."""
     cfg = resolve_provider(args)        # fail fast on bad provider/key before any work
+    if qatar is not None and getattr(args, "symbol", None):
+        args._profile = qatar.profile_for_year(args.symbol, getattr(args, "year", None))
+        if args._profile:
+            print(f"🇶🇦 Qatar profile: {args._profile.get('name_as_of')} "
+                  f"[{args._profile.get('archetype')}] — "
+                  f"{len(args._profile.get('active_events') or [])} regime/event(s) in force by {args.year}")
     print(f"📄 Reading {Path(args.pdf).name} …  (provider: {cfg['name']}, model: {cfg['model']})")
     pages, sha = pdf_to_pages(args.pdf, args.ocr)
     total_chars = sum(len(pg["text"]) for pg in pages)

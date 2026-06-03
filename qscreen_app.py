@@ -38,107 +38,16 @@ except ImportError:
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024  # 64 MB upload cap
 
-# ── QSE taxonomy ─────────────────────────────────────────────────────────────
-# The full sector → sub-sector tree shown on qscreen.app (mirrors
-# src/lib/qse-companies.ts QSE_SUBSECTORS). Each sub-sector maps to one of the
-# engine's 5 EXTRACTION categories, which drive the LLM's parsing hint:
-#   conventional_bank → interest income/expense, NIM
-#   islamic_bank      → sukuk / profit-sharing / quasi-equity, NO interest
-#   insurance         → gross/net premiums, claims, loss & combined ratios
-#   industrial        → revenue / COGS / inventory  ← ONLY for businesses that
-#                       actually have cost-of-goods and inventory
-#   other             → neutral (no archetype hint) — correct for asset/service
-#                       businesses (real estate, utilities, telecom, holdings,
-#                       healthcare services) that have NO COGS/inventory, so
-#                       they must not be told "report COGS/inventory".
-# The rich sub-sector is always stored in metadata regardless of category.
-QSE_TAXONOMY = {
-    "Banks & Financial Services": [
-        ("Commercial Bank", "conventional_bank"),
-        ("Islamic Bank", "islamic_bank"),
-        ("Brokerage", "other"),
-        ("Joint Investment", "other"),
-        ("Financial Holding", "other"),
-        ("Islamic Financial Services", "islamic_bank"),
-    ],
-    "Insurance": [
-        ("Conventional Insurance", "insurance"),
-        ("Takaful Insurance", "insurance"),
-        ("Reinsurance", "insurance"),
-        ("Life & Medical Insurance", "insurance"),
-    ],
-    "Real Estate": [   # rental/NAV/occupancy businesses — no COGS/inventory
-        ("Diversified Real Estate", "other"),
-        ("Property Development", "other"),
-        ("Real Estate Holding", "other"),
-    ],
-    "Industrials": [
-        ("Petrochemicals", "industrial"),
-        ("Aluminium", "industrial"),
-        ("Utilities", "other"),               # regulated revenue, not COGS-driven
-        ("Cement & Building Materials", "industrial"),
-        ("Oil & Gas Services", "industrial"),
-        ("Diversified Manufacturing", "industrial"),
-        ("Industrial Holding", "other"),       # holding co — consolidates, no own COGS
-        ("Diversified Conglomerate", "other"),
-        ("Diversified Holding", "other"),
-        ("Trading & Distribution", "industrial"),
-    ],
-    "Consumer Goods & Services": [
-        ("Food & Beverages", "industrial"),
-        ("Food Production", "industrial"),
-        ("Supermarkets & Retail", "industrial"),
-        ("Fuel Retail", "industrial"),
-        ("Technology Distribution", "industrial"),
-        ("Medical Devices", "industrial"),
-        ("Healthcare Services", "other"),      # service revenue, no COGS/inventory
-        ("Education", "other"),
-        ("Media & Entertainment", "other"),
-    ],
-    "Telecom & Technology": [   # service revenue (ARPU/subscribers) — no inventory
-        ("Telecom Operator", "other"),
-        ("IT Services", "other"),
-    ],
-    "Transport": [   # freight/charter service revenue — no COGS/inventory
-        ("Shipping & Marine", "other"),
-        ("Warehousing & Logistics", "other"),
-        ("LNG Shipping", "other"),
-    ],
-    "Energy": [("Energy", "industrial")],
-    "Other": [("Other", "other")],
-}
+# ── QSE taxonomy + per-stock knowledge ───────────────────────────────────────
+# The sector → sub-sector tree and the symbol map now live in the qatar/ package
+# (the single source of truth, with per-stock temporal profiles). Each sub-sector
+# still maps to one of the engine's 5 EXTRACTION archetypes, which drive the LLM's
+# parsing hint (conventional_bank / islamic_bank / insurance / industrial / other).
+import qatar
 
-# sub-sector label -> extraction category
-SUBSECTOR_TO_EXTRACTION = {
-    sub: cat for group in QSE_TAXONOMY.values() for (sub, cat) in group
-}
-
-# symbol -> sub-sector label (mirrors QSE_SUBSECTORS in qse-companies.ts)
-SYMBOL_SUBSECTOR = {
-    "QNBK": "Commercial Bank", "CBQK": "Commercial Bank", "DHBK": "Commercial Bank",
-    "ABQK": "Commercial Bank", "KCBK": "Commercial Bank",
-    "QIBK": "Islamic Bank", "QIIK": "Islamic Bank", "MARK": "Islamic Bank",
-    "DUBK": "Islamic Bank", "QFBQ": "Islamic Bank",
-    "DBIS": "Brokerage", "QOIS": "Joint Investment", "NLCS": "Financial Holding",
-    "IHGS": "Islamic Financial Services",
-    "QATI": "Conventional Insurance", "DOHI": "Conventional Insurance",
-    "QGRI": "Reinsurance", "QLMI": "Life & Medical Insurance",
-    "AKHI": "Takaful Insurance", "QISI": "Takaful Insurance", "BEMA": "Takaful Insurance",
-    "UDCD": "Diversified Real Estate", "BRES": "Property Development",
-    "ERES": "Real Estate Holding", "MRDS": "Property Development",
-    "IQCD": "Petrochemicals", "MPHC": "Petrochemicals", "QAMC": "Aluminium",
-    "QEWS": "Utilities", "QNCD": "Cement & Building Materials", "GISS": "Oil & Gas Services",
-    "QIMD": "Diversified Manufacturing", "QIGD": "Industrial Holding",
-    "AHCS": "Diversified Conglomerate", "IGRD": "Diversified Holding",
-    "MKDM": "Diversified Holding", "MHAR": "Industrial Holding", "SIIS": "Trading & Distribution",
-    "ZHCD": "Food & Beverages", "WDAM": "Food Production", "MERS": "Supermarkets & Retail",
-    "BLDN": "Food Production", "QFLS": "Fuel Retail", "MCCS": "Technology Distribution",
-    "QGMD": "Medical Devices", "MCGS": "Healthcare Services", "FALH": "Education",
-    "QCFS": "Media & Entertainment",
-    "ORDS": "Telecom Operator", "VFQS": "Telecom Operator", "MEZA": "IT Services",
-    "TQES": "IT Services",
-    "QNNS": "Shipping & Marine", "GWCS": "Warehousing & Logistics", "QGTS": "LNG Shipping",
-}
+QSE_TAXONOMY = qatar.QSE_TAXONOMY
+SUBSECTOR_TO_EXTRACTION = qatar.SUBSECTOR_TO_EXTRACTION
+SYMBOL_SUBSECTOR = qatar.SYMBOL_SUBSECTOR
 
 
 def _subsector_options_html() -> str:
@@ -341,6 +250,7 @@ def extract():
             no_json_mode=False, llm_key=None,
         )
         cfg = engine.resolve_provider(args)   # raises SystemExit (caught below) if no provider/key
+        args._profile = qatar.profile_for_year(symbol, int(year))  # company+year-aware prompting
 
         # Save the upload to a private temp file (not a predictable CWD path).
         fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="qscreen_upload_")

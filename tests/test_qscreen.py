@@ -540,6 +540,76 @@ def test_upload_filing_builds_request(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer tok"
 
 
+# ── comparatives (prior-year column) ─────────────────────────────────────────
+
+def test_validate_accepts_comparatives():
+    f = good_filing()
+    f["statements"][0]["line_items"][0]["comparatives"] = [{"period_label": "2022", "value": 9}]
+    assert e.validate_filing(f) == []
+
+
+def test_validate_rejects_bad_comparatives():
+    f = good_filing()
+    f["statements"][0]["line_items"][0]["comparatives"] = [{"value": 9}]   # no period_label
+    assert any("comparatives" in p for p in e.validate_filing(f))
+    f["statements"][0]["line_items"][0]["comparatives"] = "2022:9"          # not a list
+    assert any("comparatives" in p for p in e.validate_filing(f))
+
+
+def test_normalize_folds_prior_value_alias():
+    d = {"metadata": {}, "audit": {}, "notes": [], "extraction_quality": {},
+         "statements": [{"type": "income_statement", "verbatim_text": "x", "line_items": [
+             {"account_code": "IS_REVENUE", "label_verbatim": "Revenue", "value": 10,
+              "prior_value": 8, "prior_period_label": "2022"}]}]}
+    n = e.normalize_filing(d)
+    comps = n["statements"][0]["line_items"][0]["comparatives"]
+    assert comps == [{"period_label": "2022", "value": 8}]
+
+
+def test_merge_carries_comparatives_across_overlap():
+    w1 = e.empty_filing(); w2 = e.empty_filing()
+    w1["statements"].append({"type": "income_statement", "verbatim_text": "longer block ...........",
+        "line_items": [{"label_verbatim": "Revenue", "value": 10, "account_code": "IS_REVENUE"}]})
+    w2["statements"].append({"type": "income_statement", "verbatim_text": "x",
+        "line_items": [{"label_verbatim": "Revenue", "value": 10, "account_code": "IS_REVENUE",
+                        "comparatives": [{"period_label": "2022", "value": 8}]}]})
+    st = e.merge_filings([w1, w2])["statements"][0]
+    assert st["line_items"][0]["comparatives"] == [{"period_label": "2022", "value": 8}]
+
+
+def test_flatten_includes_prior_columns():
+    assert "prior_value" in e.EXPORT_COLUMNS and "prior_period_label" in e.EXPORT_COLUMNS
+    f = good_filing()
+    f["statements"][0]["line_items"][0]["comparatives"] = [{"period_label": "2022", "value": 9}]
+    row = e.flatten_line_items(f)[0]
+    assert row["prior_period_label"] == "2022" and row["prior_value"] == 9
+
+
+# ── profile-aware prompting (Qatar context injection) ────────────────────────
+
+def test_qatar_context_empty_for_none():
+    assert e._qatar_context(None) == ""
+
+
+def test_system_prompt_injects_profile_context():
+    import qatar
+    sp = e._system_prompt("conventional_bank", False, qatar.profile_for_year("QNBK", 2016))
+    assert "QATAR ANALYST CONTEXT" in sp
+    assert "Turkey" in sp and "Basel III" in sp          # event timeline in force by 2016
+    assert "comparatives" in sp                          # comparatives instruction present
+
+
+def test_system_prompt_pre_acquisition_year_omits_segment():
+    import qatar
+    sp = e._system_prompt("conventional_bank", False, qatar.profile_for_year("QNBK", 2012))
+    assert "QNB Finansbank" not in sp                    # Turkey not acquired until 2016
+
+
+def test_system_prompt_without_profile_is_clean():
+    sp = e._system_prompt("islamic_bank", False, None)
+    assert "QATAR ANALYST CONTEXT" not in sp
+
+
 # ── self-test entrypoint still green ─────────────────────────────────────────
 
 def test_self_test_passes():

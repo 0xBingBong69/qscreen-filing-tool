@@ -25,7 +25,11 @@ qscreen-ingest = "qscreen_ingest:main"
 qscreen-app = "qscreen_app:main"
 
 [tool.setuptools]
-py-modules = ["qscreen_ingest", "qscreen_app"]
+py-modules = ["qscreen_ingest", "qscreen_app", "qscreen_series"]
+packages = ["qatar"]
+
+[tool.setuptools.package-data]
+qatar = ["profiles/*.json"]
 
 [tool.setuptools.dynamic]
 version = { attr = "qscreen_ingest.__version__" }

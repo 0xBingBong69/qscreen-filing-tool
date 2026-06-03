@@ -105,6 +105,28 @@ reports/QNBK_2023.pdf,QNBK,conventional_bank,2023,FY
 
 One bad filing is reported and the batch continues; a summary prints at the end.
 
+## Qatar intelligence (per-stock, time-aware)
+
+The tool ships with a Qatar knowledge base (`qatar/`) covering all **55 QSE
+tickers**. Each profile is *time-aware* — it knows each company's name changes,
+foreign subsidiaries and their currencies, expected business/geography segments,
+and a dated event timeline (acquisitions, Basel III, IFRS 9, IAS 29
+hyperinflation, etc.). When you extract a filing for a known symbol + year, the
+engine automatically injects a **"Qatar analyst context"** into the prompt so it
+knows what to look for in *that* company and *that* year (e.g. QNB has Egypt from
+2013 and Turkey from 2016; Masraf Al Rayan absorbed al khaliji in 2021).
+
+Extraction now also captures the **prior-year comparative** column every filing
+prints, so a single PDF yields two years of structured data.
+
+Stack several filings into one per-symbol, multi-year series (the input for
+analysis/valuation):
+
+```bash
+python3 qscreen_series.py --symbol QNBK QNBK_2022_FY_filing.json QNBK_2023_FY_filing.json
+# → QNBK_series.json  (years, per-metric values, and any restatements flagged)
+```
+
 ## Testing
 
 ```bash
