@@ -34,6 +34,7 @@ import qscreen_dcf
 import qscreen_report
 import qscreen_portfolio
 import qscreen_workbook
+import qscreen_statements
 
 try:
     from flask import Flask, request, Response, send_file
@@ -360,6 +361,7 @@ f.onsubmit = async (e) => {
       html += '<a class="dl" id="dl" href="#">⬇ qscreen JSON</a>';
       html += '<a class="dl" id="xlsx" href="#">⬇ Excel transcript</a>';
       html += '<a class="dl" id="csv" href="#">⬇ CSV</a>';
+      html += '<a class="dl" id="stmt" href="#">📄 Statements (HTML)</a>';
       html += '<a class="dl" id="rep" href="#">📰 Analyst report</a>';
       if (UPLOAD_ENABLED && !data.problems.length)
         html += '<a class="dl up" id="up" href="#">⬆ Upload to qscreen.app</a>'
@@ -392,6 +394,18 @@ f.onsubmit = async (e) => {
         catch(e){ cv.textContent = '⬇ CSV failed'; } };
       const dg = document.getElementById('dcfgo');
       if (dg) dg.onclick = (ev) => { ev.preventDefault(); runDcf(); };
+      const st = document.getElementById('stmt');
+      if (st) st.onclick = async (ev) => {
+        ev.preventDefault(); const label = st.textContent; st.textContent = '📄 Building…';
+        try {
+          const r = await fetch('/statements', { method: 'POST', headers: {'Content-Type':'application/json'},
+                                                 body: JSON.stringify({ filing: lastFiling }) });
+          const d = await r.json(); if (!r.ok) throw new Error(d.error || 'failed');
+          const url = URL.createObjectURL(new Blob([d.html], {type:'text/html'}));
+          const a = document.createElement('a'); a.href = url; a.download = (lastSymbol||'filing') + '_statements.html'; a.click();
+          URL.revokeObjectURL(url); st.textContent = label;
+        } catch (e) { st.textContent = '📄 Statements failed'; }
+      };
       const rp = document.getElementById('rep');
       if (rp) rp.onclick = async (ev) => {
         ev.preventDefault(); const label = rp.textContent; rp.textContent = '📰 Building…';
@@ -553,6 +567,19 @@ def workbook_route():
     sym = (filings[-1].get("metadata") or {}).get("symbol") or "filing"
     return Response(data, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     headers={"Content-Disposition": f'attachment; filename="{sym}_transcript.xlsx"'})
+
+
+@app.route("/statements", methods=["POST"])
+def statements_route():
+    """Printable HTML statements document for a filing. Body: {filing}. Returns {html}."""
+    payload = request.get_json(silent=True) or {}
+    filing = payload.get("filing")
+    if not isinstance(filing, dict):
+        return {"error": "missing 'filing' object"}, 400
+    try:
+        return {"html": qscreen_statements.render_statements_html(filing)}
+    except Exception as e:
+        return {"error": str(e)}, 400
 
 
 @app.route("/export.csv", methods=["POST"])

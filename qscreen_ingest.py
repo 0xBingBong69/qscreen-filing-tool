@@ -1178,13 +1178,20 @@ def run_filing(args) -> int:
 
     save_json(filing, args)
     for fmt in (getattr(args, "export", None) or []):
-        out = f"{args.symbol.upper()}_{args.year}_{args.period}_filing.{fmt}"
+        base = f"{args.symbol.upper()}_{args.year}_{args.period}"
         if fmt == "csv":
+            out = f"{base}_filing.csv"
             print(f"📑 Exported {export_csv(filing, out)} line item(s) → {out}")
-        else:                                    # xlsx → the multi-sheet workbook transcript
+        elif fmt == "xlsx":
+            out = f"{base}_filing.xlsx"           # the multi-sheet workbook transcript
             import qscreen_workbook
             qscreen_workbook.save_workbook(filing, out)
             print(f"📑 Exported Excel transcript → {out}")
+        else:                                    # html → printable statements document
+            out = f"{base}_statements.html"
+            import qscreen_statements
+            qscreen_statements.save_statements_html(filing, out)
+            print(f"📄 Exported statements document → {out}")
 
     # Both outputs: optionally also persist the derived analysis/valuation locally.
     # A failure here must never sink a successful extraction — but it IS surfaced.
@@ -1294,9 +1301,9 @@ def main() -> int:
                    help="OCR scanned pages (auto: only near-empty pages; needs pytesseract+tesseract)")
     p.add_argument("--no-json-mode", action="store_true",
                    help="Don't send response_format=json_object (some providers reject it)")
-    p.add_argument("--export", choices=["csv", "xlsx"], action="append",
-                   help="Also write csv (flat line-items table) and/or xlsx (multi-sheet Excel "
-                        "transcript: Summary + per-statement + multi-year grid). Repeatable.")
+    p.add_argument("--export", choices=["csv", "xlsx", "html"], action="append",
+                   help="Also write csv (flat line-items table), xlsx (multi-sheet Excel "
+                        "transcript), and/or html (printable statements document). Repeatable.")
     p.add_argument("--analyze", action="store_true",
                    help="Also compute and save <symbol>_<year>_<period>_analysis.json + _valuation.json")
     p.add_argument("--with-analysis", action="store_true",
