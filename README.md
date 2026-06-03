@@ -81,13 +81,31 @@ python3 qscreen_ingest.py <PDF_PATH> \
 - `--period`: `FY | Q1 | Q2 | Q3 | Q4 | H1 | 9M` (default `FY`)
 - `--provider` / `--model` — choose the LLM (see the table above; default auto-detect)
 - `--dry-run` — produce the JSON **without** uploading (inspect first)
-- `--export csv` / `--export xlsx` — also write a flattened line-items table (repeatable)
+- `--export csv` — also write a flat line-items table; `--export xlsx` — also write the
+  **Excel financial-transcript workbook** (see below). Repeatable.
 - `--ocr auto|never|always` — OCR scanned pages (`auto` only does near-empty pages; needs the `ocr` extra + system `tesseract`/`poppler`)
 - `--version` — print the tool version
 
 The tool extracts (chunked page windows + table recovery), normalizes the
 fields to the contract, validates, saves `SYMBOL_YEAR_PERIOD_filing.json`, and
 uploads to qscreen.app. A non-conforming extract is saved but **not** uploaded.
+
+## Outputs — pick what you need
+
+Every extraction can produce, by your choice:
+
+| Output | How | What it is |
+|---|---|---|
+| **qscreen.app JSON** | always saved; `--upload`/the app button | the structured, uploadable filing contract |
+| **Excel transcript** (`.xlsx`) | `--export xlsx`, or the app's *Excel transcript* button | a multi-sheet workbook: Summary, one sheet per statement (as printed, current + prior columns, numeric cells), a **multi-year grid** (canonical metrics × fiscal years — paste into a model), plus Segments & Notes |
+| **CSV** | `--export csv`, or the app's *CSV* button | a flat line-items table for quick grep/import |
+| **Analysis / valuation JSON** | `--analyze` | computed ratios, red flags, DCF (`qscreen_analyze`/`qscreen_dcf`) |
+| **Analyst report** (HTML/MD) | `qscreen_report.py`, or the app's *Analyst report* button | the one-page synthesis |
+
+The browser app shows an **Outputs** row after each extract so you can download any
+of these (or upload the JSON). `qscreen_workbook.build_workbook(filing, filings=…)`
+builds the workbook programmatically; `POST /workbook` and `POST /export.csv` serve
+the Excel and CSV downloads.
 
 ### Batch mode
 

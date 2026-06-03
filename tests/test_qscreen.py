@@ -226,13 +226,7 @@ def test_flatten_and_csv_export(tmp_path):
     assert lines[0].split(",")[0] == "statement_type"
 
 
-def test_xlsx_export(tmp_path):
-    out = tmp_path / "x.xlsx"
-    n = e.export_xlsx(good_filing(), str(out))
-    from openpyxl import load_workbook
-    ws = load_workbook(str(out)).active
-    assert n == 1
-    assert ws.max_row == 2 and ws.max_column == len(e.EXPORT_COLUMNS)
+# (xlsx is now the multi-sheet workbook transcript — see tests/test_workbook.py)
 
 
 # ── batch manifest ───────────────────────────────────────────────────────────

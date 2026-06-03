@@ -1133,22 +1133,6 @@ def export_csv(filing: dict, path: str) -> int:
     return len(rows)
 
 
-def export_xlsx(filing: dict, path: str) -> int:
-    try:
-        from openpyxl import Workbook
-    except Exception:
-        raise SystemExit("xlsx export needs openpyxl:  pip install openpyxl")
-    rows = flatten_line_items(filing)
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "line_items"
-    ws.append(EXPORT_COLUMNS)
-    for r in rows:
-        ws.append([r[c] for c in EXPORT_COLUMNS])
-    wb.save(path)
-    return len(rows)
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def save_json(filing: dict, args) -> str:
@@ -1195,8 +1179,12 @@ def run_filing(args) -> int:
     save_json(filing, args)
     for fmt in (getattr(args, "export", None) or []):
         out = f"{args.symbol.upper()}_{args.year}_{args.period}_filing.{fmt}"
-        n = export_csv(filing, out) if fmt == "csv" else export_xlsx(filing, out)
-        print(f"📑 Exported {n} line item(s) → {out}")
+        if fmt == "csv":
+            print(f"📑 Exported {export_csv(filing, out)} line item(s) → {out}")
+        else:                                    # xlsx → the multi-sheet workbook transcript
+            import qscreen_workbook
+            qscreen_workbook.save_workbook(filing, out)
+            print(f"📑 Exported Excel transcript → {out}")
 
     # Both outputs: optionally also persist the derived analysis/valuation locally.
     # A failure here must never sink a successful extraction — but it IS surfaced.
@@ -1307,7 +1295,8 @@ def main() -> int:
     p.add_argument("--no-json-mode", action="store_true",
                    help="Don't send response_format=json_object (some providers reject it)")
     p.add_argument("--export", choices=["csv", "xlsx"], action="append",
-                   help="Also write a flattened line-items table (repeatable: --export csv --export xlsx)")
+                   help="Also write csv (flat line-items table) and/or xlsx (multi-sheet Excel "
+                        "transcript: Summary + per-statement + multi-year grid). Repeatable.")
     p.add_argument("--analyze", action="store_true",
                    help="Also compute and save <symbol>_<year>_<period>_analysis.json + _valuation.json")
     p.add_argument("--with-analysis", action="store_true",
