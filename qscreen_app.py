@@ -161,7 +161,10 @@ PAGE = """<!doctype html>
   #out { white-space: pre-wrap; background: #f6f6f6; border: 1px solid #e0e0e0; border-radius: 8px; padding: 14px; margin-top: 20px; display: none; }
   .ok { color: #0a7; } .warn { color: #c80; } .err { color: #c33; }
   .hint { color: #888; font-size: 13px; margin: 6px 0 0; min-height: 16px; }
-  a.dl { display: inline-block; margin-top: 14px; padding: 10px 16px; background: #06c; color: #fff; border-radius: 8px; text-decoration: none; font-weight: 600; }
+  a.dl { display: inline-block; margin-top: 14px; margin-right: 8px; padding: 10px 16px; background: #06c; color: #fff; border-radius: 8px; text-decoration: none; font-weight: 600; }
+  a.up { background: #0b6; } a.up.busy { background: #999; pointer-events: none; }
+  .muted { color: #888; font-weight: 400; font-size: 12px; }
+  details.adv { margin-top: 14px; } summary { cursor: pointer; color: #06c; font-weight: 600; }
 </style></head><body>
 <h1>QScreen Filing Ingestor</h1>
 <p class="sub">Drop a QSE financial-report PDF, fill the fields, click Extract. Then download the report and upload it to qscreen.app. Type a known symbol and the sub-sector auto-fills.</p>
@@ -186,11 +189,25 @@ PAGE = """<!doctype html>
       </select>
     </div>
   </div>
+  <details class="adv"><summary>Advanced — provider / model</summary>
+    <div class="row">
+      <div><label>Provider</label>
+        <select name="provider">
+          <option value="openrouter">openrouter</option>
+          <option value="minimax">minimax</option>
+          <option value="kimi">kimi</option>
+        </select>
+      </div>
+      <div><label>Model <span class="muted">(blank = provider default)</span></label>
+        <input name="model" placeholder="default" autocomplete="off"></div>
+    </div>
+  </details>
   <button type="submit" id="go">Extract</button>
 </form>
 <div id="out"></div>
 <script>
 const SYMBOL_SUBSECTOR = __SYMBOL_MAP_JSON__;
+const UPLOAD_ENABLED = __UPLOAD_ENABLED__;
 const f = document.getElementById('f'), out = document.getElementById('out'), go = document.getElementById('go');
 const symbolEl = document.getElementById('symbol'), subEl = document.getElementById('subsector'), hintEl = document.getElementById('hint');
 symbolEl.addEventListener('input', () => {
@@ -203,7 +220,7 @@ symbolEl.addEventListener('input', () => {
     hintEl.textContent = sym ? (sym + ' not in the known list — pick the sub-sector manually') : '';
   }
 });
-let lastBlob = null, lastName = 'filing.json';
+let lastBlob = null, lastName = 'filing.json', lastFiling = null;
 f.onsubmit = async (e) => {
   e.preventDefault();
   go.disabled = true; go.textContent = 'Extracting… (this can take a few minutes)';
@@ -216,14 +233,38 @@ f.onsubmit = async (e) => {
       let html = '<span class="' + (data.problems.length ? 'warn' : 'ok') + '">' + data.summary + '</span>';
       if (data.problems.length) html += '\\n\\nNotes:\\n - ' + data.problems.join('\\n - ');
       lastBlob = new Blob([JSON.stringify(data.filing, null, 2)], {type:'application/json'});
-      lastName = data.filename;
+      lastName = data.filename; lastFiling = data.filing;
       html += '\\n\\n<a class="dl" id="dl" href="#">⬇ Download ' + data.filename + '</a>';
+      if (UPLOAD_ENABLED && !data.problems.length)
+        html += '<a class="dl up" id="up" href="#">⬆ Upload to qscreen.app</a>';
       out.innerHTML = html;
       document.getElementById('dl').onclick = (ev) => {
         ev.preventDefault();
         const url = URL.createObjectURL(lastBlob);
         const a = document.createElement('a'); a.href = url; a.download = lastName; a.click();
         URL.revokeObjectURL(url);
+      };
+      const up = document.getElementById('up');
+      if (up) up.onclick = async (ev) => {
+        ev.preventDefault();
+        up.classList.add('busy'); up.textContent = '⬆ Uploading…';
+        const note = document.createElement('div');
+        try {
+          const r = await fetch('/upload', { method: 'POST', headers: {'Content-Type':'application/json'},
+                                             body: JSON.stringify({ filing: lastFiling }) });
+          const d = await r.json();
+          if (r.ok) { up.textContent = '✅ Uploaded to qscreen.app'; }
+          else {
+            up.classList.remove('busy'); up.textContent = '⬆ Retry upload';
+            note.className = 'err';
+            note.textContent = 'Upload failed: ' + (d.error || 'unknown') +
+              (d.problems ? '\\n - ' + d.problems.join('\\n - ') : '');
+            out.appendChild(note);
+          }
+        } catch (err) {
+          up.classList.remove('busy'); up.textContent = '⬆ Retry upload';
+          note.className = 'err'; note.textContent = 'Upload failed: ' + err; out.appendChild(note);
+        }
       };
     }
   } catch (err) { out.innerHTML = '<span class="err">Request failed: ' + err + '</span>'; }
@@ -235,9 +276,11 @@ f.onsubmit = async (e) => {
 
 @app.route("/")
 def index():
+    upload_enabled = bool(os.getenv("INGEST_TOKEN"))
     html = (PAGE
             .replace("__SUBSECTOR_OPTIONS__", _subsector_options_html())
-            .replace("__SYMBOL_MAP_JSON__", json.dumps(SYMBOL_SUBSECTOR)))
+            .replace("__SYMBOL_MAP_JSON__", json.dumps(SYMBOL_SUBSECTOR))
+            .replace("__UPLOAD_ENABLED__", "true" if upload_enabled else "false"))
     return Response(html, mimetype="text/html")
 
 
@@ -256,6 +299,10 @@ def extract():
         # The rich QSE sub-sector is stored; the extraction category (1 of 5)
         # drives how the LLM reads the statements.
         sector = SUBSECTOR_TO_EXTRACTION.get(subsector, "other")
+        provider = (request.form.get("provider") or "openrouter").strip()
+        if provider not in ("openrouter", "minimax", "kimi"):
+            provider = "openrouter"
+        model = (request.form.get("model") or "").strip() or None
 
         # Save the upload to a private temp file (not a predictable CWD path).
         fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="qscreen_upload_")
@@ -266,15 +313,18 @@ def extract():
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
-        key = (engine.os.getenv("LLM_API_KEY") or engine.os.getenv("OPENROUTER_API_KEY")
-               or engine.os.getenv("MINIMAX_API_KEY"))
+        env = engine.os.getenv
+        if provider == "minimax":
+            key = env("MINIMAX_API_KEY") or env("LLM_API_KEY")
+        else:
+            key = env("LLM_API_KEY") or env("OPENROUTER_API_KEY") or env("MINIMAX_API_KEY")
         if not key:
-            return {"error": "No LLM key. Put OPENROUTER_API_KEY in scripts/.env or the environment."}, 400
+            return {"error": "No LLM key. Put OPENROUTER_API_KEY in the tool's .env or the environment."}, 400
 
         # Build the same args object the CLI uses, with sane defaults.
         args = SimpleNamespace(
             symbol=symbol, sector=sector, year=int(year), period=period,
-            provider="openrouter", base_url=None, model=None,
+            provider=provider, base_url=None, model=model,
             max_tokens=16384, timeout=600, retries=4,
             pages_per_chunk=12, overlap=1, no_chunk=False,
             no_json_mode=False, llm_key=key,
@@ -286,7 +336,7 @@ def extract():
             "fiscal_year": int(year),
             "fiscal_period": period, "source_file": up.filename, "source_sha256": sha,
             "extracted_at": engine.datetime.now(engine.timezone.utc).isoformat(),
-            "extractor": {"provider": "openrouter", "model": engine.DEFAULT_MODELS["openrouter"]},
+            "extractor": {"provider": provider, "model": model or engine.DEFAULT_MODELS.get(provider)},
         })
         problems = engine.validate_filing(filing)
         summary = (f"Extracted {len(filing.get('statements', []))} statements, "
@@ -305,6 +355,33 @@ def extract():
         }
     except Exception as e:
         return {"error": str(e), "detail": traceback.format_exc()[-1500:]}, 500
+
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    """Opt-in upload of an already-extracted filing to qscreen.app.
+
+    Only enabled when the server has INGEST_TOKEN set; the extract step never
+    uploads on its own — the user clicks Upload explicitly. A non-conforming
+    filing is rejected here too, mirroring the CLI's safety gate.
+    """
+    token = os.getenv("INGEST_TOKEN")
+    if not token:
+        return {"error": "No INGEST_TOKEN configured on the server; cannot upload."}, 400
+    payload = request.get_json(silent=True) or {}
+    filing = payload.get("filing")
+    if not isinstance(filing, dict):
+        return {"error": "missing 'filing' object"}, 400
+    problems = engine.validate_filing(filing)
+    if problems:
+        return {"error": "filing is non-conforming; not uploading", "problems": problems}, 400
+    args = SimpleNamespace(
+        api_url=os.getenv("QSCREEN_API_URL", "http://localhost:3004"), token=token)
+    try:
+        resp = engine.upload_filing(filing, args)
+        return {"ok": True, "response": resp}
+    except Exception as e:
+        return {"error": str(e)}, 502
 
 
 if __name__ == "__main__":

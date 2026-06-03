@@ -26,6 +26,7 @@ validated against the contract -> saved AND uploaded. Self-test: --self-test.
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -33,6 +34,8 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+__version__ = "1.0.0"
 
 
 # ── .env loader (no python-dotenv dependency) ────────────────────────────────
@@ -806,6 +809,56 @@ def run_self_test() -> int:
     return 0
 
 
+# ── Exports (flattened line-items table for human review) ────────────────────
+
+EXPORT_COLUMNS = ["statement_type", "statement_title", "period_label", "account_code",
+                  "label_verbatim", "value", "note_ref", "depth", "is_subtotal"]
+
+
+def flatten_line_items(filing: dict) -> list[dict]:
+    rows: list[dict] = []
+    for st in filing.get("statements") or []:
+        for li in st.get("line_items") or []:
+            rows.append({
+                "statement_type": st.get("type"),
+                "statement_title": st.get("title"),
+                "period_label": st.get("period_label"),
+                "account_code": li.get("account_code"),
+                "label_verbatim": li.get("label_verbatim"),
+                "value": li.get("value"),
+                "note_ref": li.get("note_ref"),
+                "depth": li.get("depth"),
+                "is_subtotal": li.get("is_subtotal"),
+            })
+    return rows
+
+
+def export_csv(filing: dict, path: str) -> int:
+    import csv
+    rows = flatten_line_items(filing)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=EXPORT_COLUMNS)
+        w.writeheader()
+        w.writerows(rows)
+    return len(rows)
+
+
+def export_xlsx(filing: dict, path: str) -> int:
+    try:
+        from openpyxl import Workbook
+    except Exception:
+        raise SystemExit("xlsx export needs openpyxl:  pip install openpyxl")
+    rows = flatten_line_items(filing)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "line_items"
+    ws.append(EXPORT_COLUMNS)
+    for r in rows:
+        ws.append([r[c] for c in EXPORT_COLUMNS])
+    wb.save(path)
+    return len(rows)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def save_json(filing: dict, args) -> str:
@@ -815,43 +868,9 @@ def save_json(filing: dict, args) -> str:
     return out
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(description="One-file QSE filing ingestor for qscreen.app")
-    p.add_argument("pdf", nargs="?", help="Path to the filing PDF")
-    p.add_argument("--symbol")
-    p.add_argument("--sector", choices=SECTORS)
-    p.add_argument("--year", type=int)
-    p.add_argument("--period", choices=["FY", "Q1", "Q2", "Q3", "Q4", "H1", "9M"], default="FY")
-    p.add_argument("--provider", choices=["openrouter", "minimax", "kimi", "custom"], default="openrouter")
-    p.add_argument("--base-url", help="Override base URL (required for --provider custom)")
-    p.add_argument("--model", help="Override model id (default per provider)")
-    p.add_argument("--max-tokens", type=int, default=16384)
-    p.add_argument("--timeout", type=int, default=600)
-    p.add_argument("--retries", type=int, default=4)
-    p.add_argument("--pages-per-chunk", type=int, default=12)
-    p.add_argument("--overlap", type=int, default=1)
-    p.add_argument("--no-chunk", action="store_true")
-    p.add_argument("--ocr", choices=["auto", "never", "always"], default="auto",
-                   help="OCR scanned pages (auto: only near-empty pages; needs pytesseract+tesseract)")
-    p.add_argument("--no-json-mode", action="store_true",
-                   help="Don't send response_format=json_object (some providers reject it)")
-    p.add_argument("--llm-key", default=(os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-                                         or os.getenv("MINIMAX_API_KEY")))
-    p.add_argument("--api-url", default=os.getenv("QSCREEN_API_URL", "http://localhost:3004"))
-    p.add_argument("--token", default=os.getenv("INGEST_TOKEN"))
-    p.add_argument("--dry-run", action="store_true", help="Extract + save, but do not upload")
-    p.add_argument("--self-test", action="store_true", help="Validate contract/normalize/merge offline and exit")
-    args = p.parse_args()
-
-    if args.self_test:
-        return run_self_test()
-
-    missing = [n for n in ("pdf", "symbol", "sector", "year") if not getattr(args, n)]
-    if missing:
-        p.error(f"missing required argument(s): {', '.join('--' + m if m != 'pdf' else 'pdf' for m in missing)}")
-    if not args.llm_key:
-        p.error("LLM key required (set OPENROUTER_API_KEY in .env, or pass --llm-key)")
-
+def run_filing(args) -> int:
+    """Extract one PDF → save (+ optional export) → optionally upload. Returns
+    an exit code: 0 ok, 2 saved-but-non-conforming (not uploaded)."""
     print(f"📄 Reading {Path(args.pdf).name} …")
     pages, sha = pdf_to_pages(args.pdf, args.ocr)
     total_chars = sum(len(pg["text"]) for pg in pages)
@@ -877,6 +896,10 @@ def main() -> int:
         print("   (saved for inspection; NOT uploading a non-conforming extract)")
 
     save_json(filing, args)
+    for fmt in (getattr(args, "export", None) or []):
+        out = f"{args.symbol.upper()}_{args.year}_{args.period}_filing.{fmt}"
+        n = export_csv(filing, out) if fmt == "csv" else export_xlsx(filing, out)
+        print(f"📑 Exported {n} line item(s) → {out}")
 
     if problems:
         print("❌ Not uploading — fix extraction problems above first.")
@@ -891,6 +914,100 @@ def main() -> int:
     print("📤 Uploading to qscreen.app …")
     print(f"   ✅ {upload_filing(filing, args)}")
     return 0
+
+
+def read_manifest(path: str) -> list[dict]:
+    """Parse a batch CSV with columns: pdf, symbol, sector, year[, period]."""
+    import csv
+    rows: list[dict] = []
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        for i, raw in enumerate(csv.DictReader(f), 1):
+            row = {(k or "").strip().lower(): (v or "").strip() for k, v in raw.items()}
+            missing = [c for c in ("pdf", "symbol", "sector", "year") if not row.get(c)]
+            if missing:
+                raise SystemExit(f"manifest row {i}: missing column(s): {', '.join(missing)}")
+            rows.append(row)
+    if not rows:
+        raise SystemExit(f"manifest {path!r} has no data rows")
+    return rows
+
+
+def run_batch(args) -> int:
+    rows = read_manifest(args.manifest)
+    print(f"📚 Batch: {len(rows)} filing(s) from {args.manifest}")
+    worst, results = 0, []
+    for i, row in enumerate(rows, 1):
+        period = (row.get("period") or "FY").upper()
+        print(f"\n══ [{i}/{len(rows)}] {row['symbol']} {row['year']} {period} ══")
+        sector = _normalize_sector(row["sector"])
+        if sector not in SECTORS:
+            print(f"   ⚠️  unknown sector {row['sector']!r}; using 'other'")
+            sector = "other"
+        ra = copy.copy(args)
+        ra.pdf, ra.symbol, ra.sector, ra.year, ra.period = (
+            row["pdf"], row["symbol"], sector, int(row["year"]), period)
+        try:
+            code = run_filing(ra)
+        except SystemExit as e:
+            print(f"   ❌ {e}")
+            code = 1
+        except Exception as e:  # one bad filing must not abort the batch
+            print(f"   ❌ {type(e).__name__}: {e}")
+            code = 1
+        results.append((row["symbol"], row["year"], period, code))
+        worst = max(worst, code)
+    print("\n── batch summary ──")
+    for sym, yr, per, code in results:
+        mark = "✅" if code == 0 else ("⚠️ " if code == 2 else "❌")
+        print(f"   {mark} {sym} {yr} {per} (exit {code})")
+    return worst
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="One-file QSE filing ingestor for qscreen.app")
+    p.add_argument("--version", action="version", version=f"qscreen-filing-tool {__version__}")
+    p.add_argument("pdf", nargs="?", help="Path to the filing PDF")
+    p.add_argument("--symbol")
+    p.add_argument("--sector", choices=SECTORS)
+    p.add_argument("--year", type=int)
+    p.add_argument("--period", choices=["FY", "Q1", "Q2", "Q3", "Q4", "H1", "9M"], default="FY")
+    p.add_argument("--provider", choices=["openrouter", "minimax", "kimi", "custom"], default="openrouter")
+    p.add_argument("--base-url", help="Override base URL (required for --provider custom)")
+    p.add_argument("--model", help="Override model id (default per provider)")
+    p.add_argument("--max-tokens", type=int, default=16384)
+    p.add_argument("--timeout", type=int, default=600)
+    p.add_argument("--retries", type=int, default=4)
+    p.add_argument("--pages-per-chunk", type=int, default=12)
+    p.add_argument("--overlap", type=int, default=1)
+    p.add_argument("--no-chunk", action="store_true")
+    p.add_argument("--ocr", choices=["auto", "never", "always"], default="auto",
+                   help="OCR scanned pages (auto: only near-empty pages; needs pytesseract+tesseract)")
+    p.add_argument("--no-json-mode", action="store_true",
+                   help="Don't send response_format=json_object (some providers reject it)")
+    p.add_argument("--export", choices=["csv", "xlsx"], action="append",
+                   help="Also write a flattened line-items table (repeatable: --export csv --export xlsx)")
+    p.add_argument("--manifest", help="Batch mode: CSV with columns pdf,symbol,sector,year[,period]")
+    p.add_argument("--llm-key", default=(os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+                                         or os.getenv("MINIMAX_API_KEY")))
+    p.add_argument("--api-url", default=os.getenv("QSCREEN_API_URL", "http://localhost:3004"))
+    p.add_argument("--token", default=os.getenv("INGEST_TOKEN"))
+    p.add_argument("--dry-run", action="store_true", help="Extract + save, but do not upload")
+    p.add_argument("--self-test", action="store_true", help="Validate contract/normalize/merge offline and exit")
+    args = p.parse_args()
+
+    if args.self_test:
+        return run_self_test()
+
+    if not args.llm_key:
+        p.error("LLM key required (set OPENROUTER_API_KEY in .env, or pass --llm-key)")
+
+    if args.manifest:
+        return run_batch(args)
+
+    missing = [n for n in ("pdf", "symbol", "sector", "year") if not getattr(args, n)]
+    if missing:
+        p.error(f"missing required argument(s): {', '.join('--' + m if m != 'pdf' else 'pdf' for m in missing)}")
+    return run_filing(args)
 
 
 if __name__ == "__main__":
