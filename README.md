@@ -137,6 +137,44 @@ annotations** from the profile — e.g. QNB's Turkey segment is flagged as TRY w
 renders this automatically after an extract, and there's a `POST /segments` route
 to re-analyze any filing JSON.
 
+### Analysis — ratios, trends & red flags
+
+`qscreen_analyze.analyze()` computes **sector-specific ratios** (ROE/ROA/NIM/cost-income/
+NPL/CAR/LDR for banks; loss/expense/combined ratio for insurers; margins/leverage/FCF/
+payout for the rest), **multi-year trends** (YoY, CAGR), and **rule-based red flags**
+(low CAR near the Basel III minimum, rising NPLs, margin compression, negative FCF,
+FX-driven equity erosion, restatements, adverse audit opinions). It **prefers figures the
+company actually reported** (`basis: "reported"`), computes the rest (`basis: "computed"`),
+and never invents a number.
+
+```bash
+python3 qscreen_analyze.py --symbol QNBK QNBK_2022_FY_filing.json QNBK_2023_FY_filing.json
+# → QNBK_analysis.json + a printed red-flag summary.   Add --narrative for an
+#   LLM analyst write-up grounded in the computed figures.
+```
+
+The browser app shows key ratios + red flags after each extract; `POST /analyze` returns
+the full analysis object for one or more filings.
+
+### Valuation — DCF / forecast simulator
+
+`qscreen_dcf.value()` picks the right model for the company type — **FCFE DCF** for
+non-financials, a **residual-income (excess-return)** model for banks & insurers (whose
+"free cash flow" is ill-defined), plus **DDM** when dividends are disclosed — **seeds the
+assumptions from the company's own history**, and returns a year-by-year projection, the
+explicit-vs-terminal PV split, equity & per-share value, upside vs a given price, and a
+**growth × discount-rate sensitivity grid**.
+
+```bash
+python3 qscreen_dcf.py --symbol IQCD IQCD_2022_FY_filing.json IQCD_2023_FY_filing.json \
+  --discount-rate 0.10 --terminal-growth 0.025 --shares 6050000000 --price 13.1
+```
+
+The browser app adds an **adjustable DCF panel** (discount rate / growth / terminal / years
+/ shares / price) after each extract, recomputing live via `POST /dcf` with a sensitivity
+grid. (A bank model collapses to book value when ROE equals the cost of equity — the
+standard sanity check — and is covered by tests.)
+
 ## Testing
 
 ```bash
