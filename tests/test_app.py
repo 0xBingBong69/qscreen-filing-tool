@@ -178,6 +178,16 @@ def test_index_has_workbook_button(client):
     assert "runWorkbook" in h and "Excel workbook" in h
 
 
+def test_statements_route(client):
+    r = client.post("/statements", json={"filing": _statement_filing()})
+    assert r.status_code == 200
+    assert r.get_json()["html"].startswith("<!doctype html>")
+
+
+def test_statements_route_missing(client):
+    assert client.post("/statements", json={}).status_code == 400
+
+
 def _bank_filing(sym, ni, eq):
     li = [{"account_code": c, "label_verbatim": c, "value": v,
            "comparatives": [{"period_label": "2022", "value": v}]}

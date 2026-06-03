@@ -98,6 +98,7 @@ Every extraction can produce, by your choice:
 |---|---|---|
 | **qscreen.app JSON** | always saved; `--upload`/the app button | the structured, uploadable filing contract |
 | **Excel transcript** (`.xlsx`) | `--export xlsx`, or the app's *Excel transcript* button | a multi-sheet workbook: Summary, one sheet per statement (as printed, current + prior columns, numeric cells), a **multi-year grid** (canonical metrics × fiscal years — paste into a model), plus Segments & Notes |
+| **Statements document** (`.html`) | `--export html`, or the app's *Statements (HTML)* button | a printable, human-readable rendering of the financials (faithful line items, current + comparative columns, accounting-style negatives) — print to PDF to share |
 | **CSV** | `--export csv`, or the app's *CSV* button | a flat line-items table for quick grep/import |
 | **Analysis / valuation JSON** | `--analyze` | computed ratios, red flags, DCF (`qscreen_analyze`/`qscreen_dcf`) |
 | **Analyst report** (HTML/MD) | `qscreen_report.py`, or the app's *Analyst report* button | the one-page synthesis |
