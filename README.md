@@ -137,6 +137,25 @@ annotations** from the profile — e.g. QNB's Turkey segment is flagged as TRY w
 renders this automatically after an extract, and there's a `POST /segments` route
 to re-analyze any filing JSON.
 
+### Analysis — ratios, trends & red flags
+
+`qscreen_analyze.analyze()` computes **sector-specific ratios** (ROE/ROA/NIM/cost-income/
+NPL/CAR/LDR for banks; loss/expense/combined ratio for insurers; margins/leverage/FCF/
+payout for the rest), **multi-year trends** (YoY, CAGR), and **rule-based red flags**
+(low CAR near the Basel III minimum, rising NPLs, margin compression, negative FCF,
+FX-driven equity erosion, restatements, adverse audit opinions). It **prefers figures the
+company actually reported** (`basis: "reported"`), computes the rest (`basis: "computed"`),
+and never invents a number.
+
+```bash
+python3 qscreen_analyze.py --symbol QNBK QNBK_2022_FY_filing.json QNBK_2023_FY_filing.json
+# → QNBK_analysis.json + a printed red-flag summary.   Add --narrative for an
+#   LLM analyst write-up grounded in the computed figures.
+```
+
+The browser app shows key ratios + red flags after each extract; `POST /analyze` returns
+the full analysis object for one or more filings.
+
 ## Testing
 
 ```bash

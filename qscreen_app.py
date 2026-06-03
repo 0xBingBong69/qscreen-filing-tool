@@ -87,6 +87,8 @@ PAGE = """<!doctype html>
   .fx { background: #fde8c8; color: #a05a00; border-radius: 4px; padding: 0 5px; font-size: 11px; font-weight: 700; }
   .ev { color: #06c; cursor: help; }
   .neg { color: #c33; } .pos { color: #0a7; }
+  .rep { color: #0a7; cursor: help; font-size: 11px; } ul.flags { margin: 6px 0; padding-left: 0; list-style: none; }
+  ul.flags li { padding: 4px 0; font-size: 13px; } ul.flags li.alert { color: #c33; font-weight: 600; } ul.flags li.warn2 { color: #b06b00; }
 </style></head><body>
 <h1>QScreen Filing Ingestor</h1>
 <p class="sub">Drop a QSE financial-report PDF, fill the fields, click Extract. Then download the report and upload it to qscreen.app. Type a known symbol and the sub-sector auto-fills.</p>
@@ -173,6 +175,31 @@ function renderSegments(sa){
   }
   return h + '</div>';
 }
+const PCT_RATIOS = ['roe','roa','nim','cost_income','npl','car','coverage','ldr','net_margin','operating_margin','loss_ratio','expense_ratio','combined_ratio','dividend_payout'];
+function fmtRatio(name, r){
+  if(!r || r.value==null) return '—';
+  const v=r.value, rep=(r.basis==='reported')?' <span class="rep" title="as reported by the company">®</span>':'';
+  if(name==='fcf') return fmtNum(v)+rep;
+  if(name==='liabilities_to_equity') return v.toFixed(2)+'×'+rep;
+  const pct = (Math.abs(v)<=1.5) ? v*100 : v;
+  return pct.toFixed(1)+'%'+rep;
+}
+function renderAnalysis(an){
+  if(!an || !an.ratios) return '';
+  const yrs = Object.keys(an.ratios); if(!yrs.length) return '';
+  const y = yrs[yrs.length-1], R = an.ratios[y];
+  let h='<div class="seg"><h3>Key ratios — '+y+' ('+(an.archetype||'').replace(/_/g,' ')+') <span class="rep">® = as reported</span></h3>';
+  h+='<table class="seg"><tr><th>Ratio</th><th>Value</th></tr>';
+  for(const k of Object.keys(R)) h+='<tr><td>'+k.replace(/_/g,' ')+'</td><td>'+fmtRatio(k,R[k])+'</td></tr>';
+  h+='</table>';
+  if(an.red_flags && an.red_flags.length){
+    h+='<h4>Red flags</h4><ul class="flags">';
+    for(const f of an.red_flags){ const cls=(f.severity==='alert')?'alert':'warn2';
+      h+='<li class="'+cls+'">'+((f.severity==='alert')?'🚨':'⚠️')+' '+f.message+'</li>'; }
+    h+='</ul>';
+  }
+  return h+'</div>';
+}
 const symbolEl = document.getElementById('symbol'), subEl = document.getElementById('subsector'), hintEl = document.getElementById('hint');
 symbolEl.addEventListener('input', () => {
   const sym = symbolEl.value.trim().toUpperCase().replace(/\\.QA$/, '');
@@ -201,7 +228,8 @@ f.onsubmit = async (e) => {
       html += '\\n\\n<a class="dl" id="dl" href="#">⬇ Download ' + data.filename + '</a>';
       if (UPLOAD_ENABLED && !data.problems.length)
         html += '<a class="dl up" id="up" href="#">⬆ Upload to qscreen.app</a>';
-      html += renderSegments(data.segments_analysis);
+      html += renderSegments((data.analysis||{}).segments);
+      html += renderAnalysis(data.analysis);
       out.innerHTML = html;
       document.getElementById('dl').onclick = (ev) => {
         ev.preventDefault();
@@ -301,11 +329,12 @@ def extract():
             "extractor": {"provider": cfg["name"], "model": cfg["model"]},
         })
         problems = engine.validate_filing(filing)
-        seg_analysis = qscreen_analyze.analyze_segments(filing, args._profile)
+        analysis = qscreen_analyze.analyze(symbol, [filing], args._profile)
         nseg = len(filing.get("segments", []))
+        nflags = len(analysis.get("red_flags", []))
         summary = (f"Extracted {len(filing.get('statements', []))} statements, "
                    f"{nseg} segments, {len(filing.get('notes', []))} notes, "
-                   f"audit={filing.get('audit', {}).get('opinion_type')}.")
+                   f"audit={filing.get('audit', {}).get('opinion_type')}, {nflags} red flag(s).")
         if problems:
             summary += f" ({len(problems)} note(s) below — review before uploading.)"
         else:
@@ -315,13 +344,31 @@ def extract():
             "summary": summary,
             "problems": problems,
             "filing": filing,
-            "segments_analysis": seg_analysis,
+            "analysis": analysis,
             "filename": f"{symbol}_{year}_{period}_filing.json",
         }
     except SystemExit as e:                       # provider/key/model config errors
         return {"error": str(e)}, 400
     except Exception as e:
         return {"error": str(e), "detail": traceback.format_exc()[-1500:]}, 500
+
+
+@app.route("/analyze", methods=["POST"])
+def analyze_route():
+    """Full analysis (ratios/trends/red-flags/segments) for one or more filing
+    JSONs of the same stock. Accepts {filings:[...]} or {filing:{...}}."""
+    payload = request.get_json(silent=True) or {}
+    filings = payload.get("filings")
+    if filings is None and isinstance(payload.get("filing"), dict):
+        filings = [payload["filing"]]
+    if not isinstance(filings, list) or not filings:
+        return {"error": "missing 'filings' (list) or 'filing' (object)"}, 400
+    meta = (filings[-1].get("metadata") or {})
+    symbol = payload.get("symbol") or meta.get("symbol") or ""
+    if not symbol:
+        return {"error": "could not determine symbol"}, 400
+    profile = qatar.profile_for_year(symbol, meta.get("fiscal_year"))
+    return qscreen_analyze.analyze(symbol, filings, profile)
 
 
 @app.route("/segments", methods=["POST"])

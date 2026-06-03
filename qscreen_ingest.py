@@ -580,11 +580,14 @@ def _openai_request(messages: list[dict], cfg: dict, args):
 
 
 def _anthropic_request(messages: list[dict], cfg: dict, args):
-    # Anthropic's Messages API takes the system prompt as a top-level field and
-    # has no JSON-mode, so we prefill an assistant "{" to coax a bare object.
+    # Anthropic's Messages API takes the system prompt as a top-level field. For
+    # JSON extraction we prefill an assistant "{" to coax a bare object; for prose
+    # (no_json_mode, e.g. the analyst narrative) we leave the turn open.
+    json_mode = not getattr(args, "no_json_mode", False)
     system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
     chat = [{"role": m["role"], "content": m["content"]} for m in messages if m["role"] != "system"]
-    chat.append({"role": "assistant", "content": "{"})
+    if json_mode:
+        chat.append({"role": "assistant", "content": "{"})
     url = f"{cfg['base_url']}/messages"
     payload = {"model": cfg["model"], "max_tokens": args.max_tokens, "temperature": 0,
                "system": system, "messages": chat}
@@ -593,7 +596,7 @@ def _anthropic_request(messages: list[dict], cfg: dict, args):
 
     def extract(j):
         text = "".join(b.get("text", "") for b in j.get("content", []) if b.get("type") == "text")
-        return "{" + text          # we prefilled the opening brace
+        return ("{" + text) if json_mode else text   # reattach the prefilled brace in JSON mode
     return url, headers, payload, extract
 
 

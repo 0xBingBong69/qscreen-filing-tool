@@ -13,8 +13,13 @@ Later phases add compute_ratios / compute_trends / red_flags / DCF.
 """
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+from qscreen_series import build_series
 
 
 def _num(x):
@@ -124,6 +129,324 @@ def analyze_segments(filing: dict, profile: dict | None = None) -> dict:
     }
 
 
+# ════════════════════════════════════════════════════════════════════════════
+#  PHASE 3 — ratios, trends, red flags, analyst narrative
+# ════════════════════════════════════════════════════════════════════════════
+
+_BANK_INCOME = ["IS_NET_INTEREST", "IS_FEES_COMM", "IS_FX_GAIN", "IS_INVESTMENT_INCOME", "IS_OTHER_INCOME"]
+_BANK_COST = ["IS_STAFF", "IS_OPERATING_EXP", "IS_DEPRECIATION"]
+
+
+def _g(m, code):
+    return _num((m or {}).get(code))
+
+
+def _sum_present(m, codes):
+    vals = [v for v in (_g(m, c) for c in codes) if v is not None]
+    return sum(vals) if vals else None
+
+
+def _avg(a, b):
+    a, b = _num(a), _num(b)
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return (a + b) / 2.0
+
+
+def _safe_div(n, d):
+    n, d = _num(n), _num(d)
+    if n is None or d in (None, 0):
+        return None
+    return n / d
+
+
+def _as_fraction(x):
+    """Normalize a ratio that may be printed as a percent (19.5) or a fraction (0.195)."""
+    x = _num(x)
+    if x is None:
+        return None
+    return x / 100.0 if abs(x) > 1.5 else x
+
+
+def _r(value, basis):
+    return {"value": value, "basis": basis if value is not None else None}
+
+
+def _kpi_or(cur, kpi, computed):
+    k = _g(cur, kpi)
+    return _r(k, "reported") if k is not None else _r(computed, "computed")
+
+
+def _bank_ratios(cur, prior, islamic=False):
+    eq = _avg(_g(cur, "BS_TOTAL_EQUITY"), _g(prior, "BS_TOTAL_EQUITY"))
+    ta = _avg(_g(cur, "BS_TOTAL_ASSETS"), _g(prior, "BS_TOTAL_ASSETS"))
+    ni = _g(cur, "IS_NET_INCOME")
+    income, cost = _sum_present(cur, _BANK_INCOME), _sum_present(cur, _BANK_COST)
+    out = {
+        "roe": _r(_safe_div(ni, eq), "computed"),
+        "roa": _r(_safe_div(ni, ta), "computed"),
+        "cost_income": _kpi_or(cur, "KPI_COST_INCOME", _safe_div(cost, income)),
+        "ldr": _kpi_or(cur, "KPI_LDR", _safe_div(_g(cur, "BS_LOANS"), _g(cur, "BS_CUSTOMER_DEPOSITS"))),
+        "npl": _r(_g(cur, "KPI_NPL"), "reported"),
+        "car": _r(_g(cur, "KPI_CAR"), "reported"),
+        "coverage": _r(_g(cur, "KPI_COVERAGE"), "reported"),
+    }
+    if not islamic:
+        out["nim"] = _kpi_or(cur, "KPI_NIM", _safe_div(_g(cur, "IS_NET_INTEREST"), ta))
+    return out
+
+
+def _insurance_ratios(cur, prior):
+    eq = _avg(_g(cur, "BS_TOTAL_EQUITY"), _g(prior, "BS_TOTAL_EQUITY"))
+    loss = _kpi_or(cur, "KPI_LOSS_RATIO", _safe_div(_g(cur, "IS_CLAIMS"), _g(cur, "IS_NET_PREMIUMS")))
+    exp = _r(_g(cur, "KPI_EXPENSE_RATIO"), "reported")
+    combined = _g(cur, "KPI_COMBINED")
+    if combined is not None:
+        combined_r = _r(combined, "reported")
+    elif loss["value"] is not None and exp["value"] is not None:
+        combined_r = _r(_as_fraction(loss["value"]) + _as_fraction(exp["value"]), "computed")
+    else:
+        combined_r = _r(None, None)
+    return {"loss_ratio": loss, "expense_ratio": exp, "combined_ratio": combined_r,
+            "roe": _r(_safe_div(_g(cur, "IS_NET_INCOME"), eq), "computed")}
+
+
+def _industrial_ratios(cur, prior):
+    eq = _avg(_g(cur, "BS_TOTAL_EQUITY"), _g(prior, "BS_TOTAL_EQUITY"))
+    ta = _avg(_g(cur, "BS_TOTAL_ASSETS"), _g(prior, "BS_TOTAL_ASSETS"))
+    ni, rev = _g(cur, "IS_NET_INCOME"), _g(cur, "IS_REVENUE")
+    reported_fcf = _g(cur, "CF_FCF")
+    fcf = reported_fcf
+    if fcf is None:
+        ocf, capex = _g(cur, "CF_OCF"), _g(cur, "CF_CAPEX")
+        fcf = ocf + capex if (ocf is not None and capex is not None) else None
+    div = _g(cur, "CF_DIVIDENDS_PAID")
+    return {
+        "net_margin": _r(_safe_div(ni, rev), "computed"),
+        "operating_margin": _r(_safe_div(_g(cur, "IS_OPERATING_PROFIT"), rev), "computed"),
+        "roe": _r(_safe_div(ni, eq), "computed"),
+        "roa": _r(_safe_div(ni, ta), "computed"),
+        "liabilities_to_equity": _r(_safe_div(_g(cur, "BS_TOTAL_LIABILITIES"),
+                                              _g(cur, "BS_TOTAL_EQUITY")), "computed"),
+        "fcf": _r(fcf, "reported" if reported_fcf is not None else "computed"),
+        "dividend_payout": _r(_safe_div(abs(div) if div is not None else None, ni), "computed"),
+    }
+
+
+def compute_ratios(series: dict, archetype: str) -> dict:
+    """Per-year, sector-specific ratios. Prefers a printed KPI_* when present,
+    otherwise computes from canonical codes; returns None (never a guess) when
+    inputs are missing. `basis` records 'reported' vs 'computed'."""
+    years = series.get("years") or {}
+    out = {}
+    for y in sorted(years):
+        cur = years[y].get("metrics") or {}
+        prior = (years.get(str(int(y) - 1)) or {}).get("metrics") or {}
+        if archetype == "conventional_bank":
+            out[y] = _bank_ratios(cur, prior, islamic=False)
+        elif archetype == "islamic_bank":
+            out[y] = _bank_ratios(cur, prior, islamic=True)
+        elif archetype == "insurance":
+            out[y] = _insurance_ratios(cur, prior)
+        else:
+            out[y] = _industrial_ratios(cur, prior)
+    return out
+
+
+_TREND_CODES = {
+    "conventional_bank": ["IS_NET_INTEREST", "IS_NET_INCOME", "BS_TOTAL_ASSETS",
+                          "BS_LOANS", "BS_CUSTOMER_DEPOSITS", "BS_TOTAL_EQUITY"],
+    "islamic_bank": ["IS_NET_INCOME", "BS_TOTAL_ASSETS", "BS_LOANS",
+                     "BS_CUSTOMER_DEPOSITS", "BS_TOTAL_EQUITY"],
+    "insurance": ["IS_GROSS_PREMIUMS", "IS_NET_PREMIUMS", "IS_NET_INCOME", "BS_TOTAL_EQUITY"],
+}
+_DEFAULT_TREND = ["IS_REVENUE", "IS_OPERATING_PROFIT", "IS_NET_INCOME",
+                  "BS_TOTAL_ASSETS", "BS_TOTAL_EQUITY", "CF_OCF"]
+
+
+def compute_trends(series: dict, archetype: str) -> dict:
+    """Per-metric YoY and CAGR across the available years."""
+    years = series.get("years") or {}
+    keys = sorted(years)
+    out = {}
+    for code in _TREND_CODES.get(archetype, _DEFAULT_TREND):
+        pts = [(int(y), _num((years[y].get("metrics") or {}).get(code))) for y in keys]
+        pts = [(y, v) for y, v in pts if v is not None]
+        if not pts:
+            continue
+        latest_v = pts[-1][1]
+        yoy = _yoy(latest_v, pts[-2][1]) if len(pts) >= 2 else None
+        cagr = None
+        span = pts[-1][0] - pts[0][0]
+        if span > 0 and pts[0][1] and latest_v and pts[0][1] > 0 and latest_v > 0:
+            cagr = (latest_v / pts[0][1]) ** (1.0 / span) - 1
+        out[code] = {"latest": latest_v, "yoy": yoy, "cagr": cagr, "span_years": span,
+                     "series": {str(y): v for y, v in pts}}
+    return out
+
+
+def _val(ratios, year, name):
+    return ((ratios.get(year) or {}).get(name) or {}).get("value")
+
+
+def red_flags(series: dict, ratios: dict, profile: dict | None = None,
+              filings: list[dict] | None = None) -> list[dict]:
+    """Rule-based warnings/alerts. Conservative: fires only on figures we have."""
+    flags: list[dict] = []
+    yrs = sorted(ratios or {})
+    if yrs:
+        cur, prev = yrs[-1], (yrs[-2] if len(yrs) >= 2 else None)
+        car = _as_fraction(_val(ratios, cur, "car"))
+        if car is not None and car < 0.13:
+            flags.append({"severity": "alert", "rule": "low_car", "year": cur,
+                          "message": f"Capital adequacy {car * 100:.1f}% is close to the Basel III minimum."})
+        npl = _as_fraction(_val(ratios, cur, "npl"))
+        if npl is not None and npl > 0.04:
+            flags.append({"severity": "warn", "rule": "high_npl", "year": cur,
+                          "message": f"NPL ratio {npl * 100:.1f}% is elevated."})
+        nm = _val(ratios, cur, "net_margin")
+        fcf = _val(ratios, cur, "fcf")
+        if fcf is not None and fcf < 0:
+            flags.append({"severity": "warn", "rule": "negative_fcf", "year": cur,
+                          "message": "Free cash flow is negative."})
+        cr = _as_fraction(_val(ratios, cur, "combined_ratio"))
+        if cr is not None and cr > 1.0:
+            flags.append({"severity": "alert", "rule": "underwriting_loss", "year": cur,
+                          "message": f"Combined ratio {cr * 100:.0f}% exceeds 100% — underwriting loss."})
+        if prev:
+            npl_p = _as_fraction(_val(ratios, prev, "npl"))
+            if npl is not None and npl_p is not None and npl - npl_p > 0.005:
+                flags.append({"severity": "warn", "rule": "rising_npl", "year": cur,
+                              "message": f"NPL ratio rose {(npl - npl_p) * 100:.1f}pp year-on-year."})
+            ci, ci_p = _as_fraction(_val(ratios, cur, "cost_income")), _as_fraction(_val(ratios, prev, "cost_income"))
+            if ci is not None and ci_p is not None and ci - ci_p > 0.03:
+                flags.append({"severity": "warn", "rule": "rising_cost_income", "year": cur,
+                              "message": f"Cost-to-income rose to {ci * 100:.0f}%."})
+            nm_p = _val(ratios, prev, "net_margin")
+            if nm is not None and nm_p is not None and nm < nm_p - 0.03:
+                flags.append({"severity": "warn", "rule": "margin_compression", "year": cur,
+                              "message": f"Net margin fell to {nm * 100:.0f}% (from {nm_p * 100:.0f}%)."})
+
+    sy = sorted((series.get("years") or {}))
+    if len(sy) >= 2:
+        eq_now = _g(series["years"][sy[-1]].get("metrics"), "BS_TOTAL_EQUITY")
+        eq_prev = _g(series["years"][sy[-2]].get("metrics"), "BS_TOTAL_EQUITY")
+        if eq_now is not None and eq_prev is not None and eq_now < eq_prev:
+            flags.append({"severity": "warn", "rule": "equity_decline", "year": sy[-1],
+                          "message": "Total equity declined year-on-year (possible FX translation effect)."})
+    if series.get("restatements"):
+        flags.append({"severity": "warn", "rule": "restatement", "year": None,
+                      "message": f"{len(series['restatements'])} prior-year figure(s) were restated."})
+
+    for f in filings or []:
+        audit = f.get("audit") or {}
+        fy = (f.get("metadata") or {}).get("fiscal_year")
+        if (audit.get("material_uncertainty_going_concern") or {}).get("present"):
+            flags.append({"severity": "alert", "rule": "going_concern", "year": fy,
+                          "message": "Auditor flagged material uncertainty over going concern."})
+        if audit.get("opinion_type") not in (None, "unknown", "unqualified"):
+            flags.append({"severity": "alert", "rule": "audit_opinion", "year": fy,
+                          "message": f"Audit opinion is '{audit.get('opinion_type')}' (not unqualified)."})
+    return flags
+
+
+def _narrative_args(args=None):
+    base = dict(provider=None, base_url=None, model=None, llm_key=None,
+                max_tokens=1500, timeout=120, retries=3, no_json_mode=True)
+    if args is not None:
+        for k in base:
+            v = getattr(args, k, None)
+            if v is not None:
+                base[k] = v
+    return SimpleNamespace(**base)
+
+
+def analyst_narrative(analysis: dict, args=None) -> str:
+    """Optional LLM pass: writes a Qatar-specialist commentary over the
+    PRE-COMPUTED figures (the model narrates; it must not invent numbers)."""
+    import qscreen_ingest as engine
+    brief = {k: analysis.get(k) for k in ("symbol", "archetype", "reporting_currency",
+                                          "ratios", "trends", "red_flags")}
+    system = ("You are a senior equity analyst specialising in Qatar Stock Exchange (QSE) "
+              "companies. You are given PRE-COMPUTED figures — never invent or recompute "
+              "numbers; cite only what is provided. Write a concise plain-English analysis "
+              "(5-8 sentences): the multi-year trend, profitability and key ratios versus the "
+              "norm for this kind of QSE company, any red flags, and the segment / FX dynamics. "
+              "Reference the company's known events (acquisitions, Basel III, FX) where relevant.")
+    user = ("Company timeline & expectations:\n"
+            + json.dumps(analysis.get("profile_context") or {}, ensure_ascii=False)[:2000]
+            + "\n\nComputed figures:\n" + json.dumps(brief, ensure_ascii=False)[:6000])
+    return engine.call_llm([{"role": "system", "content": system},
+                            {"role": "user", "content": user}], _narrative_args(args))
+
+
+def analyze(symbol: str, filings: list[dict], profile: dict | None = None, *,
+            narrative: bool = False, args=None) -> dict:
+    """Full analysis over a stock's filings: series → ratios → trends → red flags
+    → segments (latest) → optional analyst narrative."""
+    series = build_series(symbol, filings)
+    archetype = (profile or {}).get("archetype") or "other"
+    ratios = compute_ratios(series, archetype)
+    trends = compute_trends(series, archetype)
+    flags = red_flags(series, ratios, profile, filings)
+    latest = (max(filings, key=lambda f: (f.get("metadata") or {}).get("fiscal_year") or 0)
+              if filings else {})
+    segs = analyze_segments(latest, profile)
+    profile_context = None
+    if profile:
+        profile_context = {k: profile.get(k) for k in
+                           ("ticker", "name_as_of", "archetype", "sub_sector",
+                            "reporting_currency", "active_events", "watch_kpis")}
+    out = {
+        "symbol": symbol.upper(), "archetype": archetype,
+        "reporting_currency": series.get("currency"),
+        "years": sorted(series.get("years") or {}),
+        "ratios": ratios, "trends": trends, "red_flags": flags,
+        "segments": segs, "restatements": series.get("restatements") or [],
+        "profile_context": profile_context, "warnings": series.get("warnings") or [],
+    }
+    if narrative:
+        try:
+            out["narrative"] = analyst_narrative(out, args)
+        except SystemExit as ex:
+            out["narrative_error"] = str(ex)
+    return out
+
+
 def save_analysis(obj: dict, path: str) -> str:
     Path(path).write_text(json.dumps(obj, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Analyse a QSE stock's filings (ratios, trends, red flags)")
+    p.add_argument("--symbol", required=True)
+    p.add_argument("filings", nargs="+", help="SYMBOL_YEAR_PERIOD_filing.json files")
+    p.add_argument("--narrative", action="store_true", help="add an LLM analyst narrative (needs an API key)")
+    p.add_argument("--provider")
+    p.add_argument("--model")
+    p.add_argument("--llm-key")
+    args = p.parse_args()
+
+    filings = [json.loads(Path(fp).read_text(encoding="utf-8")) for fp in args.filings]
+    profile = None
+    try:
+        import qatar
+        meta0 = filings[0].get("metadata") or {}
+        profile = qatar.profile_for_year(args.symbol, meta0.get("fiscal_year"))
+    except Exception:
+        pass
+    out = analyze(args.symbol, filings, profile, narrative=args.narrative, args=args)
+    path = save_analysis(out, f"{args.symbol.upper()}_analysis.json")
+    nflags = len(out["red_flags"])
+    print(f"🧮 {out['symbol']} [{out['archetype']}] → {path}  "
+          f"({len(out['years'])} years, {nflags} red flag(s))")
+    for fl in out["red_flags"]:
+        print(f"   {'🚨' if fl['severity'] == 'alert' else '⚠️ '} {fl['message']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
