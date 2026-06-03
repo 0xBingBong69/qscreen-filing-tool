@@ -194,15 +194,20 @@ PAGE = """<!doctype html>
   <details class="adv"><summary>Advanced — provider / model</summary>
     <div class="row">
       <div><label>Provider</label>
-        <select name="provider">
-          <option value="openrouter">openrouter</option>
+        <select name="provider" id="provider">
+          <option value="">auto (server's configured key)</option>
           <option value="minimax">minimax</option>
+          <option value="openrouter">openrouter</option>
           <option value="kimi">kimi</option>
+          <option value="openai">openai</option>
+          <option value="anthropic">claude (anthropic)</option>
         </select>
       </div>
       <div><label>Model <span class="muted">(blank = provider default)</span></label>
-        <input name="model" placeholder="default" autocomplete="off"></div>
+        <input name="model" id="model" placeholder="default" autocomplete="off"></div>
     </div>
+    <p class="muted">Set the matching key in the tool's <code>.env</code>
+      (MINIMAX_API_KEY, OPENROUTER_API_KEY, MOONSHOT_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY).</p>
   </details>
   <button type="submit" id="go">Extract</button>
 </form>
@@ -210,7 +215,12 @@ PAGE = """<!doctype html>
 <script>
 const SYMBOL_SUBSECTOR = __SYMBOL_MAP_JSON__;
 const UPLOAD_ENABLED = __UPLOAD_ENABLED__;
+const PROVIDER_MODELS = __PROVIDER_MODELS_JSON__;
 const f = document.getElementById('f'), out = document.getElementById('out'), go = document.getElementById('go');
+const provEl = document.getElementById('provider'), modelEl = document.getElementById('model');
+if (provEl) provEl.addEventListener('change', () => {
+  modelEl.placeholder = PROVIDER_MODELS[provEl.value] || 'default';
+});
 const symbolEl = document.getElementById('symbol'), subEl = document.getElementById('subsector'), hintEl = document.getElementById('hint');
 symbolEl.addEventListener('input', () => {
   const sym = symbolEl.value.trim().toUpperCase().replace(/\\.QA$/, '');
@@ -279,9 +289,11 @@ f.onsubmit = async (e) => {
 @app.route("/")
 def index():
     upload_enabled = bool(os.getenv("INGEST_TOKEN"))
+    provider_models = {name: cfg["default_model"] for name, cfg in engine.PROVIDERS.items()}
     html = (PAGE
             .replace("__SUBSECTOR_OPTIONS__", _subsector_options_html())
             .replace("__SYMBOL_MAP_JSON__", json.dumps(SYMBOL_SUBSECTOR))
+            .replace("__PROVIDER_MODELS_JSON__", json.dumps(provider_models))
             .replace("__UPLOAD_ENABLED__", "true" if upload_enabled else "false"))
     return Response(html, mimetype="text/html")
 
@@ -301,10 +313,19 @@ def extract():
         # The rich QSE sub-sector is stored; the extraction category (1 of 5)
         # drives how the LLM reads the statements.
         sector = SUBSECTOR_TO_EXTRACTION.get(subsector, "other")
-        provider = (request.form.get("provider") or "openrouter").strip()
-        if provider not in ("openrouter", "minimax", "kimi"):
-            provider = "openrouter"
+        provider = (request.form.get("provider") or "").strip() or None  # None → auto-detect
         model = (request.form.get("model") or "").strip() or None
+
+        # Build the same args object the CLI uses; resolve_provider picks the
+        # base URL / model / key (from the matching env var) and validates them.
+        args = SimpleNamespace(
+            symbol=symbol, sector=sector, year=int(year), period=period,
+            provider=provider, base_url=None, model=model,
+            max_tokens=16384, timeout=600, retries=4,
+            pages_per_chunk=12, overlap=1, no_chunk=False,
+            no_json_mode=False, llm_key=None,
+        )
+        cfg = engine.resolve_provider(args)   # raises SystemExit (caught below) if no provider/key
 
         # Save the upload to a private temp file (not a predictable CWD path).
         fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="qscreen_upload_")
@@ -315,30 +336,13 @@ def extract():
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
-        env = engine.os.getenv
-        if provider == "minimax":
-            key = env("MINIMAX_API_KEY") or env("LLM_API_KEY")
-        else:
-            key = env("LLM_API_KEY") or env("OPENROUTER_API_KEY") or env("MINIMAX_API_KEY")
-        if not key:
-            return {"error": "No LLM key. Put OPENROUTER_API_KEY in the tool's .env or the environment."}, 400
-
-        # Build the same args object the CLI uses, with sane defaults.
-        args = SimpleNamespace(
-            symbol=symbol, sector=sector, year=int(year), period=period,
-            provider=provider, base_url=None, model=model,
-            max_tokens=16384, timeout=600, retries=4,
-            pages_per_chunk=12, overlap=1, no_chunk=False,
-            no_json_mode=False, llm_key=key,
-        )
-
         filing = engine.extract_filing(pages, args)
         filing.setdefault("metadata", {}).update({
             "symbol": symbol, "sector": sector, "sub_sector": subsector,
             "fiscal_year": int(year),
             "fiscal_period": period, "source_file": up.filename, "source_sha256": sha,
             "extracted_at": engine.datetime.now(engine.timezone.utc).isoformat(),
-            "extractor": {"provider": provider, "model": model or engine.DEFAULT_MODELS.get(provider)},
+            "extractor": {"provider": cfg["name"], "model": cfg["model"]},
         })
         problems = engine.validate_filing(filing)
         summary = (f"Extracted {len(filing.get('statements', []))} statements, "
@@ -355,6 +359,8 @@ def extract():
             "filing": filing,
             "filename": f"{symbol}_{year}_{period}_filing.json",
         }
+    except SystemExit as e:                       # provider/key/model config errors
+        return {"error": str(e)}, 400
     except Exception as e:
         return {"error": str(e), "detail": traceback.format_exc()[-1500:]}, 500
 

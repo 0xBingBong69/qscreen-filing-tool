@@ -22,18 +22,37 @@ pip install -e ".[xlsx,ocr]"     # + Excel export and OCR for scanned PDFs
 
 ## Configure (once)
 
-Create a `.env` next to the tool (it is gitignored):
+Create a `.env` next to the tool (it is gitignored). **Set the key for whichever
+LLM provider you use** — the tool auto-detects it:
 
 ```
-OPENROUTER_API_KEY=sk-or-...        # LLM key (or MINIMAX_API_KEY / LLM_API_KEY)
+MINIMAX_API_KEY=...                 # or OPENROUTER_API_KEY / OPENAI_API_KEY /
+                                    # ANTHROPIC_API_KEY / MOONSHOT_API_KEY (kimi)
 INGEST_TOKEN=...                    # qscreen.app ingest token (only needed to upload)
 QSCREEN_API_URL=https://qscreen.app # defaults to http://localhost:3004
 ```
 
+### Choosing a provider / model
+
+| Provider | `--provider` | API key env | Default model |
+|----------|--------------|-------------|---------------|
+| MiniMax | `minimax` | `MINIMAX_API_KEY` | `MiniMax-M2` |
+| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` | `minimax/minimax-01` |
+| Kimi (Moonshot) | `kimi` | `MOONSHOT_API_KEY` | `kimi-k2-0905-preview` |
+| OpenAI | `openai` | `OPENAI_API_KEY` | `gpt-4o` |
+| Claude (Anthropic) | `anthropic` / `claude` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-5` |
+| Any OpenAI-compatible URL | `custom` | `LLM_API_KEY` | *(pass `--model` + `--base-url`)* |
+
+- **Auto-detect:** leave `--provider` off and the tool uses whichever key is set.
+- **Force a provider:** `--provider minimax` (or env `QSCREEN_PROVIDER=minimax`).
+- **Pick a model:** `--model <id>` (or env `QSCREEN_MODEL`). Defaults are overridable —
+  if a model id is rejected, the error tells you to pass `--model`.
+- `python3 qscreen_ingest.py --list-providers` prints this table.
+
 > **Note on Claude Code on the web:** the managed environment's network policy
-> may block LLM providers (e.g. `openrouter.ai`). The extractor needs to reach
-> the provider, so run it where that host is allowed, or permit it in the
-> environment's network policy.
+> may block LLM providers (e.g. `openrouter.ai`, `api.anthropic.com`). The
+> extractor needs to reach the provider, so run it where that host is allowed,
+> or permit it in the environment's network policy.
 
 ## Option A — local browser app
 
@@ -57,6 +76,7 @@ python3 qscreen_ingest.py <PDF_PATH> \
 
 - `--sector`: `conventional_bank | islamic_bank | industrial | insurance | other`
 - `--period`: `FY | Q1 | Q2 | Q3 | Q4 | H1 | 9M` (default `FY`)
+- `--provider` / `--model` — choose the LLM (see the table above; default auto-detect)
 - `--dry-run` — produce the JSON **without** uploading (inspect first)
 - `--export csv` / `--export xlsx` — also write a flattened line-items table (repeatable)
 - `--ocr auto|never|always` — OCR scanned pages (`auto` only does near-empty pages; needs the `ocr` extra + system `tesseract`/`poppler`)

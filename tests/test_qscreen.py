@@ -361,6 +361,112 @@ def test_extract_windowed_skips_unparseable(monkeypatch):
     assert any(s["type"] == "cash_flow" for s in out["statements"])  # survived a bad window
 
 
+# ── provider registry / resolution (no network) ─────────────────────────────
+
+_PROVIDER_ENV = ("MINIMAX_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY",
+                 "ANTHROPIC_API_KEY", "MOONSHOT_API_KEY", "KIMI_API_KEY",
+                 "QSCREEN_PROVIDER", "LLM_PROVIDER", "QSCREEN_MODEL", "LLM_API_KEY")
+
+
+@pytest.fixture
+def clean_provider_env(monkeypatch):
+    for k in _PROVIDER_ENV:
+        monkeypatch.delenv(k, raising=False)
+
+
+def _pargs(**over):
+    base = dict(provider=None, base_url=None, model=None, llm_key=None,
+                max_tokens=128, no_json_mode=False, retries=2, timeout=5)
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_canonical_provider_aliases():
+    assert e.canonical_provider("claude") == "anthropic"
+    assert e.canonical_provider("CLAUDE") == "anthropic"
+    assert e.canonical_provider("moonshot") == "kimi"
+    assert e.canonical_provider("gpt") == "openai"
+    assert e.canonical_provider(None) is None
+
+
+def test_default_model_and_listing():
+    assert e.default_model("minimax") == "MiniMax-M2"
+    assert e.default_model("claude") == e.PROVIDERS["anthropic"]["default_model"]
+    assert e.default_model("nope") is None
+    txt = e.list_providers()
+    for name in ("minimax", "openrouter", "kimi", "openai", "anthropic", "custom"):
+        assert name in txt
+
+
+def test_resolve_explicit_minimax(clean_provider_env):
+    cfg = e.resolve_provider(_pargs(provider="minimax", llm_key="sk-mm"))
+    assert cfg["name"] == "minimax" and cfg["kind"] == "openai"
+    assert cfg["base_url"] == "https://api.minimax.io/v1" and cfg["key"] == "sk-mm"
+
+
+def test_resolve_claude_alias_is_anthropic(clean_provider_env):
+    cfg = e.resolve_provider(_pargs(provider="claude", llm_key="sk-an"))
+    assert cfg["name"] == "anthropic" and cfg["kind"] == "anthropic"
+
+
+def test_resolve_autodetects_from_env_key(clean_provider_env, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-oai")
+    cfg = e.resolve_provider(_pargs())
+    assert cfg["name"] == "openai" and cfg["key"] == "sk-oai"
+
+
+def test_resolve_env_provider_and_model_override(clean_provider_env, monkeypatch):
+    monkeypatch.setenv("QSCREEN_PROVIDER", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-an")
+    monkeypatch.setenv("QSCREEN_MODEL", "claude-custom")
+    cfg = e.resolve_provider(_pargs())
+    assert cfg["name"] == "anthropic" and cfg["model"] == "claude-custom"
+
+
+def test_resolve_custom_requires_base_url(clean_provider_env):
+    with pytest.raises(SystemExit):
+        e.resolve_provider(_pargs(provider="custom", llm_key="k"))
+    cfg = e.resolve_provider(_pargs(provider="custom", base_url="https://x/v1", model="m", llm_key="k"))
+    assert cfg["base_url"] == "https://x/v1" and cfg["kind"] == "openai"
+
+
+def test_resolve_missing_key_raises(clean_provider_env):
+    with pytest.raises(SystemExit) as ei:
+        e.resolve_provider(_pargs(provider="openai"))
+    assert "OPENAI_API_KEY" in str(ei.value)
+
+
+def test_anthropic_request_shape():
+    msgs = [{"role": "system", "content": "SYS"}, {"role": "user", "content": "U"}]
+    cfg = {"name": "anthropic", "base_url": "https://api.anthropic.com/v1",
+           "kind": "anthropic", "model": "claude-x", "key": "k"}
+    url, headers, payload, extract = e._anthropic_request(msgs, cfg, _pargs(max_tokens=99))
+    assert url.endswith("/messages")
+    assert headers["x-api-key"] == "k" and headers["anthropic-version"] == "2023-06-01"
+    assert payload["system"] == "SYS" and payload["max_tokens"] == 99
+    assert payload["messages"][-1] == {"role": "assistant", "content": "{"}   # JSON prefill
+    assert extract({"content": [{"type": "text", "text": '"a": 1}'}]}) == '{"a": 1}'
+
+
+def test_openai_request_shape():
+    msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]
+    cfg = {"name": "openai", "base_url": "https://api.openai.com/v1",
+           "kind": "openai", "model": "gpt", "key": "k"}
+    url, headers, payload, extract = e._openai_request(msgs, cfg, _pargs())
+    assert url.endswith("/chat/completions") and headers["Authorization"] == "Bearer k"
+    assert payload["response_format"] == {"type": "json_object"}
+    assert extract({"choices": [{"message": {"content": "X"}}]}) == "X"
+
+
+def test_call_llm_anthropic_end_to_end(clean_provider_env, monkeypatch):
+    import requests
+    monkeypatch.setattr(requests, "post",
+                        lambda *a, **k: _Resp(200, {"content": [{"type": "text", "text": '"ok": 1}'}]}))
+    out = e.call_llm([{"role": "system", "content": "S"}, {"role": "user", "content": "U"}],
+                     _pargs(provider="anthropic", llm_key="k"))
+    assert out == '{"ok": 1}'                                   # opening brace reconstructed
+
+
 # ── HTTP wrappers (requests stubbed) ─────────────────────────────────────────
 
 class _Resp:

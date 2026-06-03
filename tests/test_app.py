@@ -28,6 +28,13 @@ def test_index_upload_flag_follows_token(client, monkeypatch):
     assert "const UPLOAD_ENABLED = true;" in client.get("/").get_data(as_text=True)
 
 
+def test_index_lists_all_providers(client):
+    html = client.get("/").get_data(as_text=True)
+    for v in ("minimax", "openrouter", "kimi", "openai", "anthropic"):
+        assert f'value="{v}"' in html
+    assert "PROVIDER_MODELS = {" in html
+
+
 def test_extract_requires_pdf(client):
     r = client.post("/extract", data={"symbol": "QIBK", "subsector": "Islamic Bank", "year": "2024"})
     assert r.status_code == 400

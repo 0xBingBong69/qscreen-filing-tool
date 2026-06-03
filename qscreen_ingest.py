@@ -13,15 +13,19 @@ USAGE (the only command an operator/agent needs):
   periods: FY | Q1 | Q2 | Q3 | Q4 | H1 | 9M   (default FY)
 
 CONFIG (put in a file named `.env` next to this script, or real env vars):
-    OPENROUTER_API_KEY=sk-or-...        # LLM key (or MINIMAX_API_KEY / LLM_API_KEY)
+    MINIMAX_API_KEY=...                 # LLM key for your provider; the tool
+                                        # auto-detects minimax / openrouter /
+                                        # kimi / openai / anthropic from whichever
+                                        # *_API_KEY is set (see --list-providers)
     INGEST_TOKEN=...                    # qscreen.app ingest token (needed to upload)
     QSCREEN_API_URL=https://qscreen.app # defaults to http://localhost:3004
 
 DEPS:  pip install pdfplumber requests
 
 The tool: PDF -> (pdfplumber text + recovered tables) -> overlapping page
-windows -> LLM (OpenRouter/MiniMax) -> normalized + merged lossless JSON ->
-validated against the contract -> saved AND uploaded. Self-test: --self-test.
+windows -> LLM (minimax/openrouter/kimi/openai/anthropic) -> normalized +
+merged lossless JSON -> validated against the contract -> saved AND uploaded.
+Self-test: --self-test.   Providers: --list-providers.
 """
 from __future__ import annotations
 
@@ -185,16 +189,95 @@ def validate_filing(data: dict) -> list[str]:
 #  PROVIDERS
 # ════════════════════════════════════════════════════════════════════════════
 
-PROVIDER_BASE_URLS = {
-    "openrouter": "https://openrouter.ai/api/v1",
-    "minimax": "https://api.minimax.io/v1",
-    "kimi": "https://api.moonshot.cn/v1",
+# Each provider: the API base URL, the wire protocol ("openai" = the OpenAI
+# chat/completions shape, "anthropic" = the Anthropic Messages shape), the
+# env var(s) its key lives in, and a sensible default model. Add a provider by
+# adding a row here — nothing else needs to change. Override any field per-run
+# with --base-url / --model / --llm-key (or env QSCREEN_MODEL).
+PROVIDERS = {
+    "minimax":    {"base_url": "https://api.minimax.io/v1",   "kind": "openai",
+                   "env": ("MINIMAX_API_KEY",),               "default_model": "MiniMax-M2"},
+    "openrouter": {"base_url": "https://openrouter.ai/api/v1", "kind": "openai",
+                   "env": ("OPENROUTER_API_KEY",),            "default_model": "minimax/minimax-01"},
+    "kimi":       {"base_url": "https://api.moonshot.cn/v1",  "kind": "openai",
+                   "env": ("MOONSHOT_API_KEY", "KIMI_API_KEY"), "default_model": "kimi-k2-0905-preview"},
+    "openai":     {"base_url": "https://api.openai.com/v1",   "kind": "openai",
+                   "env": ("OPENAI_API_KEY",),                "default_model": "gpt-4o"},
+    "anthropic":  {"base_url": "https://api.anthropic.com/v1", "kind": "anthropic",
+                   "env": ("ANTHROPIC_API_KEY",),             "default_model": "claude-sonnet-4-5"},
 }
-DEFAULT_MODELS = {
-    "openrouter": "minimax/minimax-m2.7",
-    "minimax": "MiniMax-M2",
-    "kimi": "moonshot-v1-128k",
-}
+# Friendly aliases the user can type for --provider / QSCREEN_PROVIDER.
+PROVIDER_ALIASES = {"claude": "anthropic", "moonshot": "kimi", "gpt": "openai", "oai": "openai"}
+# Provider names accepted on the CLI (plus "custom" for any OpenAI-compatible URL).
+PROVIDER_CHOICES = sorted(set(PROVIDERS) | set(PROVIDER_ALIASES) | {"custom"})
+
+
+def canonical_provider(name: str | None) -> str | None:
+    if not name:
+        return None
+    n = name.strip().lower()
+    return PROVIDER_ALIASES.get(n, n)
+
+
+def default_model(name: str | None) -> str | None:
+    cfg = PROVIDERS.get(canonical_provider(name) or "")
+    return cfg["default_model"] if cfg else None
+
+
+def list_providers() -> str:
+    rows = ["Providers (set the matching API key in .env, then --provider <name>):"]
+    for name, p in PROVIDERS.items():
+        rows.append(f"  {name:11s} {p['kind']:9s} key={'/'.join(p['env']):27s} model={p['default_model']}")
+    rows.append(f"  {'custom':11s} {'openai':9s} key={'LLM_API_KEY':27s} (also pass --base-url --model)")
+    rows.append("Aliases: " + ", ".join(f"{a}→{b}" for a, b in PROVIDER_ALIASES.items()))
+    rows.append("Pick a model with --model or env QSCREEN_MODEL; pick a provider with "
+                "--provider or env QSCREEN_PROVIDER (else auto-detected from whichever key is set).")
+    return "\n".join(rows)
+
+
+def detect_provider() -> str | None:
+    """Provider from QSCREEN_PROVIDER/LLM_PROVIDER, else the first one whose key is set."""
+    env_choice = canonical_provider(os.getenv("QSCREEN_PROVIDER") or os.getenv("LLM_PROVIDER"))
+    if env_choice:
+        return env_choice
+    for name, p in PROVIDERS.items():
+        if any(os.getenv(k) for k in p["env"]):
+            return name
+    return None
+
+
+def resolve_provider(args) -> dict:
+    """Turn the chosen provider + overrides + env into a concrete
+    {name, base_url, kind, model, key}. Raises SystemExit with guidance if the
+    provider or key can't be determined — no network is touched."""
+    name = canonical_provider(getattr(args, "provider", None)) or detect_provider()
+    if not name:
+        raise SystemExit("No LLM provider selected and no provider API key found.\n\n" + list_providers())
+
+    if name == "custom":
+        base = getattr(args, "base_url", None)
+        if not base:
+            raise SystemExit("--provider custom requires --base-url (any OpenAI-compatible endpoint).")
+        cfg = {"base_url": base, "kind": "openai", "env": ("LLM_API_KEY",), "default_model": None}
+    else:
+        cfg = PROVIDERS.get(name)
+        if not cfg:
+            raise SystemExit(f"Unknown provider {name!r}.\n\n" + list_providers())
+        cfg = dict(cfg)
+        if getattr(args, "base_url", None):
+            cfg["base_url"] = args.base_url
+
+    model = getattr(args, "model", None) or os.getenv("QSCREEN_MODEL") or cfg["default_model"]
+    if not model:
+        raise SystemExit(f"No model for provider {name!r}; pass --model or set QSCREEN_MODEL.")
+    key = (getattr(args, "llm_key", None)
+           or next((os.getenv(k) for k in cfg["env"] if os.getenv(k)), None)
+           or os.getenv("LLM_API_KEY"))
+    if not key:
+        want = " or ".join(cfg["env"]) + " (or LLM_API_KEY)"
+        raise SystemExit(f"No API key for provider {name!r}. Set {want} in .env or pass --llm-key.")
+    return {"name": name, "base_url": cfg["base_url"].rstrip("/"),
+            "kind": cfg["kind"], "model": model, "key": key}
 
 
 # ── PDF → pages (text + recovered tables, optional OCR) ──────────────────────
@@ -393,17 +476,42 @@ FILING TEXT (page-delimited):
 
 # ── LLM call ──────────────────────────────────────────────────────────────────
 
+def _openai_request(messages: list[dict], cfg: dict, args):
+    url = f"{cfg['base_url']}/chat/completions"
+    payload = {"model": cfg["model"], "messages": messages,
+               "temperature": 0, "max_tokens": args.max_tokens}
+    if not getattr(args, "no_json_mode", False):
+        payload["response_format"] = {"type": "json_object"}
+    headers = {"Authorization": f"Bearer {cfg['key']}", "Content-Type": "application/json"}
+
+    def extract(j):
+        return j["choices"][0]["message"]["content"]
+    return url, headers, payload, extract
+
+
+def _anthropic_request(messages: list[dict], cfg: dict, args):
+    # Anthropic's Messages API takes the system prompt as a top-level field and
+    # has no JSON-mode, so we prefill an assistant "{" to coax a bare object.
+    system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+    chat = [{"role": m["role"], "content": m["content"]} for m in messages if m["role"] != "system"]
+    chat.append({"role": "assistant", "content": "{"})
+    url = f"{cfg['base_url']}/messages"
+    payload = {"model": cfg["model"], "max_tokens": args.max_tokens, "temperature": 0,
+               "system": system, "messages": chat}
+    headers = {"x-api-key": cfg["key"], "anthropic-version": "2023-06-01",
+               "content-type": "application/json"}
+
+    def extract(j):
+        text = "".join(b.get("text", "") for b in j.get("content", []) if b.get("type") == "text")
+        return "{" + text          # we prefilled the opening brace
+    return url, headers, payload, extract
+
+
 def call_llm(messages: list[dict], args) -> str:
     import requests
-    base = args.base_url or PROVIDER_BASE_URLS.get(args.provider)
-    if not base:
-        raise SystemExit(f"No base URL for provider {args.provider!r}; pass --base-url")
-    model = args.model or DEFAULT_MODELS.get(args.provider) or args.provider
-    url = f"{base.rstrip('/')}/chat/completions"
-    payload = {"model": model, "messages": messages, "temperature": 0, "max_tokens": args.max_tokens}
-    if not args.no_json_mode:
-        payload["response_format"] = {"type": "json_object"}
-    headers = {"Authorization": f"Bearer {args.llm_key}", "Content-Type": "application/json"}
+    cfg = resolve_provider(args)
+    builder = _anthropic_request if cfg["kind"] == "anthropic" else _openai_request
+    url, headers, payload, extract = builder(messages, cfg, args)
 
     last_err = None
     for attempt in range(1, args.retries + 1):
@@ -412,26 +520,25 @@ def call_llm(messages: list[dict], args) -> str:
         except requests.RequestException as e:
             last_err = str(e)
         else:
-            if resp.status_code in (429, 500, 502, 503, 504):
+            if resp.status_code in (429, 500, 502, 503, 504, 529):
                 last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"  # transient → retry
             elif resp.status_code in (400, 401, 403, 404, 422):
                 detail = resp.text[:300]
                 hint = ""
                 if resp.status_code in (401, 403):
                     hint = (" — check the API key, or this network may be blocking the "
-                            "provider (the remote-environment network policy must allow "
-                            f"{base}).")
+                            f"provider (the network policy must allow {cfg['base_url']}).")
                 elif "model" in detail.lower():
-                    hint = f" — model {model!r} may be invalid; pass --model with a valid slug."
-                raise SystemExit(f"LLM provider error HTTP {resp.status_code}: {detail}{hint}")
+                    hint = f" — model {cfg['model']!r} may be invalid for {cfg['name']}; pass --model."
+                raise SystemExit(f"{cfg['name']} provider error HTTP {resp.status_code}: {detail}{hint}")
             else:
                 resp.raise_for_status()
-                return resp.json()["choices"][0]["message"]["content"]
+                return extract(resp.json())
         if attempt < args.retries:
             wait = 2 ** attempt
             print(f"   ⚠️  LLM call failed ({last_err}); retry {attempt}/{args.retries - 1} in {wait}s")
             time.sleep(wait)
-    raise SystemExit(f"LLM call failed after {args.retries} attempts: {last_err}")
+    raise SystemExit(f"{cfg['name']} call failed after {args.retries} attempts: {last_err}")
 
 
 def _strip_code_fences(text: str) -> str:
@@ -871,7 +978,8 @@ def save_json(filing: dict, args) -> str:
 def run_filing(args) -> int:
     """Extract one PDF → save (+ optional export) → optionally upload. Returns
     an exit code: 0 ok, 2 saved-but-non-conforming (not uploaded)."""
-    print(f"📄 Reading {Path(args.pdf).name} …")
+    cfg = resolve_provider(args)        # fail fast on bad provider/key before any work
+    print(f"📄 Reading {Path(args.pdf).name} …  (provider: {cfg['name']}, model: {cfg['model']})")
     pages, sha = pdf_to_pages(args.pdf, args.ocr)
     total_chars = sum(len(pg["text"]) for pg in pages)
     print(f"   {len(pages)} pages, {total_chars:,} chars (text + recovered tables), sha256={sha[:12]}…")
@@ -882,7 +990,7 @@ def run_filing(args) -> int:
         "fiscal_year": args.year, "fiscal_period": args.period,
         "source_file": Path(args.pdf).name, "source_sha256": sha,
         "extracted_at": datetime.now(timezone.utc).isoformat(),
-        "extractor": {"provider": args.provider, "model": args.model or DEFAULT_MODELS.get(args.provider)},
+        "extractor": {"provider": cfg["name"], "model": cfg["model"]},
     })
 
     print(f"📊 Extracted: {len(filing.get('statements', []))} statements, "
@@ -971,9 +1079,12 @@ def main() -> int:
     p.add_argument("--sector", choices=SECTORS)
     p.add_argument("--year", type=int)
     p.add_argument("--period", choices=["FY", "Q1", "Q2", "Q3", "Q4", "H1", "9M"], default="FY")
-    p.add_argument("--provider", choices=["openrouter", "minimax", "kimi", "custom"], default="openrouter")
+    p.add_argument("--provider", choices=PROVIDER_CHOICES, default=None,
+                   help="minimax | openrouter | kimi | openai | anthropic(=claude) | custom. "
+                        "Default: env QSCREEN_PROVIDER, else auto-detected from whichever API key is set.")
     p.add_argument("--base-url", help="Override base URL (required for --provider custom)")
-    p.add_argument("--model", help="Override model id (default per provider)")
+    p.add_argument("--model", help="Override model id (default per provider; or env QSCREEN_MODEL)")
+    p.add_argument("--list-providers", action="store_true", help="Show supported providers and exit")
     p.add_argument("--max-tokens", type=int, default=16384)
     p.add_argument("--timeout", type=int, default=600)
     p.add_argument("--retries", type=int, default=4)
@@ -987,19 +1098,19 @@ def main() -> int:
     p.add_argument("--export", choices=["csv", "xlsx"], action="append",
                    help="Also write a flattened line-items table (repeatable: --export csv --export xlsx)")
     p.add_argument("--manifest", help="Batch mode: CSV with columns pdf,symbol,sector,year[,period]")
-    p.add_argument("--llm-key", default=(os.getenv("LLM_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-                                         or os.getenv("MINIMAX_API_KEY")))
+    p.add_argument("--llm-key", default=None,
+                   help="API key (else read from the provider's env var, e.g. MINIMAX_API_KEY)")
     p.add_argument("--api-url", default=os.getenv("QSCREEN_API_URL", "http://localhost:3004"))
     p.add_argument("--token", default=os.getenv("INGEST_TOKEN"))
     p.add_argument("--dry-run", action="store_true", help="Extract + save, but do not upload")
     p.add_argument("--self-test", action="store_true", help="Validate contract/normalize/merge offline and exit")
     args = p.parse_args()
 
+    if args.list_providers:
+        print(list_providers())
+        return 0
     if args.self_test:
         return run_self_test()
-
-    if not args.llm_key:
-        p.error("LLM key required (set OPENROUTER_API_KEY in .env, or pass --llm-key)")
 
     if args.manifest:
         return run_batch(args)
