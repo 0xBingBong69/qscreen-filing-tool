@@ -102,6 +102,14 @@ def test_extract_strips_path_from_source_file(client, monkeypatch):
 
 # ── The page must escape dynamic strings before innerHTML ────────────────────
 
+def test_dcf_panel_escapes_currency(client):
+    # reporting_currency comes from the filing (malicious-PDF-controllable) and is
+    # interpolated into the DCF headline; it must be escaped before innerHTML.
+    html = client.get("/").get_data(as_text=True)
+    assert "ccy=esc(d.reporting_currency" in html
+    assert "valuation, ccy=d.reporting_currency||''" not in html   # old unescaped form
+
+
 def test_index_escapes_result_panel(client):
     html = client.get("/").get_data(as_text=True)
     # the high-value sink: summary + problems from a (possibly malicious) filing
