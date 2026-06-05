@@ -1353,9 +1353,14 @@ def detect_statement_titles(text: str) -> list[tuple[str, str, int]]:
     return sorted(((st, t, i) for st, (t, i) in found.items()), key=lambda x: x[2])
 
 
+# Require a unit word to sit in an amount/currency context — so a stray
+# "serving millions of customers" in the narrative can't be read as the scale.
+_CCY = r"(?:qatari\s+)?(?:riyals?|qar|qr|usd|dollars?)"
 _UNIT_SCALE_PATTERNS = [
-    (1000000, re.compile(r"in\s+millions|\bQAR?\s*'?\s*000\s*'?\s*000|\bmillions of\b", re.IGNORECASE)),
-    (1000,    re.compile(r"in\s+thousands|thousands of|\bQAR?\s*'?\s*000\b|\b'000\b", re.IGNORECASE)),
+    (1000000, re.compile(rf"in\s+millions|millions\s+of\s+{_CCY}|"
+                         r"\bQAR?\s*'?\s*000\s*'?\s*000\b", re.IGNORECASE)),
+    (1000,    re.compile(rf"in\s+thousands|thousands\s+of\s+{_CCY}|"
+                         r"\bQAR?\s*'?\s*000\b|\b'000\b", re.IGNORECASE)),
 ]
 
 
@@ -1473,9 +1478,16 @@ def _slice_statements(text: str, titles: list[tuple[str, str, int]]) -> list[tup
 
 _TABLES_HDR_RE = re.compile(r"\[TABLES on page (\d+)\]")
 _TABLE_SEP_RE = re.compile(r"^-- table \d+ --$")
-# A bare note-reference cell: a small 1-3 digit integer (e.g. "12", "7a", "(8)")
-# printed between the label and the money columns — NOT a value.
-_NOTE_REF_CELL_RE = re.compile(r"^\(?\d{1,3}[a-z]?\)?$", re.IGNORECASE)
+# A bare note-reference cell: a small 1-3 digit integer (e.g. "12", "7a") printed
+# between the label and the money columns. NOT parenthesised (brackets = a negative
+# value, never a note ref) and never comma/decimal (those are real figures).
+_NOTE_REF_CELL_RE = re.compile(r"^\d{1,3}[a-z]?$", re.IGNORECASE)
+# A cell that is actually a number (optionally a currency prefix, brackets, %, sign).
+# Used to reject text cells like a date ("1 January 2024") that _coerce_number would
+# otherwise turn into a stray value.
+_VALUE_CELL_RE = re.compile(
+    r"^\s*(?:qar|qr|usd|sar|aed|kwd|bhd|omr|eur|gbp|[$€£])?\s*"
+    r"\(?\s*[-+]?[\d,]+(?:\.\d+)?\s*\)?\s*%?\s*$", re.IGNORECASE)
 
 
 def parse_rendered_tables(text: str) -> list[dict]:
@@ -1513,24 +1525,41 @@ def parse_rendered_tables(text: str) -> list[dict]:
     return out
 
 
+def _looks_money(num: tuple) -> bool:
+    """True when a (raw, value) numeric cell looks like a real money figure — it
+    has a thousands separator / decimal, or is large — vs a bare small integer."""
+    raw, val = num
+    return ("," in raw) or ("." in raw) or (val is not None and abs(val) >= 1000)
+
+
 def _row_to_triplet(cells: list[str]) -> dict | None:
     """One rendered table row → {label, current, prior, note_ref} (or None).
 
-    label = first cell containing a letter; numbers = cells to its right that
-    _coerce_number parses. A leading small-integer note-ref column is demoted
-    (only when ≥3 numbers remain, so a real current+prior is never lost).
+    label  = first cell with letters that is not itself a number.
+    numbers = cells to its right that look like figures (so a date cell is not
+              mistaken for a value).
+    A leading small-integer NOTE-reference column is demoted to note_ref — when
+    there are ≥3 numbers (note + current + prior) OR exactly 2 where the second is
+    clearly a money value (a single value column). This stops the note number
+    being read as the figure.
     """
     cells = [(c if c is not None else "") for c in cells]
-    label_idx = next((i for i, c in enumerate(cells) if re.search(r"[A-Za-z]", c)), None)
+    label_idx = next((i for i, c in enumerate(cells)
+                      if re.search(r"[A-Za-z]", c) and not _VALUE_CELL_RE.match(c)), None)
     if label_idx is None:
         return None
     label = cells[label_idx].strip()
     if not label:
         return None
-    nums = [(c.strip(), _coerce_number(c)) for c in cells[label_idx + 1:]]
-    nums = [(raw, v) for raw, v in nums if v is not None]
+    nums = []
+    for c in cells[label_idx + 1:]:
+        if _VALUE_CELL_RE.match(c):
+            v = _coerce_number(c)
+            if v is not None:
+                nums.append((c.strip(), v))
     note_ref = None
-    if len(nums) >= 3 and _NOTE_REF_CELL_RE.match(nums[0][0]):
+    if nums and _NOTE_REF_CELL_RE.match(nums[0][0]) and (
+            len(nums) >= 3 or (len(nums) == 2 and _looks_money(nums[1]))):
         note_ref = nums.pop(0)[0]
     current = nums[0][1] if nums else None
     prior = nums[1][1] if len(nums) > 1 else None
@@ -1843,9 +1872,13 @@ def apply_mode(args) -> None:
     """Map the friendly --mode / --basic / --pro / --no-llm onto the guided flags.
     Basic == guided (deterministic-first); Pro == the single big-prompt path."""
     mode = (getattr(args, "mode", None) or "").lower()
-    if getattr(args, "no_llm", False) or getattr(args, "basic", False) or mode == "basic":
+    wants_basic = getattr(args, "no_llm", False) or getattr(args, "basic", False) or mode == "basic"
+    wants_pro = getattr(args, "pro", False) or mode == "pro"
+    if wants_basic and wants_pro:                  # contradictory — don't silently pick one
+        raise SystemExit("Conflicting mode: choose Basic (--basic/--no-llm) OR Pro (--pro), not both.")
+    if wants_basic:
         args.guided = True
-    elif getattr(args, "pro", False) or mode == "pro":
+    elif wants_pro:
         args.no_guided = True
     # mode "auto" / unset → leave --guided/--no-guided for resolve_guided to decide
 

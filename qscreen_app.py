@@ -368,7 +368,7 @@ function runDcf(){
 }
 function renderDcfResult(d){
   if(!d || !d.valuation){ return '<span class="warn">'+esc((d&&d.warnings&&d.warnings.join('; '))||'no valuation')+'</span>'; }
-  const v=d.valuation, ccy=d.reporting_currency||'';
+  const v=d.valuation, ccy=esc(d.reporting_currency||'');
   const headline = (v.per_share!=null) ? (ccy+' '+v.per_share.toFixed(2)+' / share')
                                        : (ccy+' '+fmtNum(Math.round(v.equity_value))+' equity value');
   let h = '<p class="dcfval">'+headline+'</p>';
