@@ -63,7 +63,7 @@ def test_extract_form_threads_basic_mode(client, monkeypatch):
     import io
     captured = {}
 
-    def fake_extract_filing(pages, args):
+    def fake_extract_filing(pages, args, progress_cb=None):
         captured["guided"] = args.guided
         captured["pages_per_chunk"] = args.pages_per_chunk
         return _fake_filing()
@@ -71,7 +71,7 @@ def test_extract_form_threads_basic_mode(client, monkeypatch):
     monkeypatch.setattr(app_mod.engine, "resolve_provider",
                         lambda args: {"name": "openai", "model": "gpt-4o", "local": False,
                                       "base_url": "https://api.openai.com/v1", "kind": "openai", "key": "k"})
-    monkeypatch.setattr(app_mod.engine, "pdf_to_pages", lambda path: ([{"num": 1, "text": "x"}], "sha"))
+    monkeypatch.setattr(app_mod.engine, "pdf_to_pages", lambda path, progress_cb=None: ([{"num": 1, "text": "x"}], "sha"))
     monkeypatch.setattr(app_mod.engine, "extract_filing", fake_extract_filing)
 
     r = client.post("/extract", data={"symbol": "QNBK", "subsector": "Commercial Bank",
@@ -92,13 +92,13 @@ def test_extract_no_llm_needs_no_provider(client, monkeypatch):
     def boom(args):
         raise SystemExit("No LLM provider selected and no provider API key found.")
 
-    def fake_extract_filing(pages, args):
+    def fake_extract_filing(pages, args, progress_cb=None):
         captured["guided"] = args.guided
         captured["no_llm"] = args.no_llm
         return _fake_filing()
 
     monkeypatch.setattr(app_mod.engine, "resolve_provider", boom)
-    monkeypatch.setattr(app_mod.engine, "pdf_to_pages", lambda path: ([{"num": 1, "text": "x"}], "sha"))
+    monkeypatch.setattr(app_mod.engine, "pdf_to_pages", lambda path, progress_cb=None: ([{"num": 1, "text": "x"}], "sha"))
     monkeypatch.setattr(app_mod.engine, "extract_filing", fake_extract_filing)
 
     r = client.post("/extract", data={"symbol": "QNBK", "subsector": "Commercial Bank",

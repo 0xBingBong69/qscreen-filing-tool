@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import html
 
+import qscreen_ui
+
 E = html.escape
 
 _TITLE = {
@@ -25,20 +27,20 @@ _TITLE = {
 }
 _UNIT = {1: "actual units", 1000: "thousands", 1000000: "millions"}
 
+# Page-specific rules only; palette, tables, .muted and .cat come from
+# qscreen_ui.css() (prepended below). Keep the tr.sub / td.num selectors.
 _CSS = """
-body{font:14px/1.5 -apple-system,system-ui,sans-serif;color:#1a1a1a;max-width:840px;margin:24px auto;padding:0 20px}
+body{font:14px/1.5 var(--font);max-width:840px;margin:24px auto;padding:0 20px}
 h1{font-size:23px;margin:0 0 2px} h2{font-size:16px;margin:0 0 2px}
-.sub{color:#555;margin:0 0 2px} .muted{color:#888;font-size:12px;margin:2px 0}
-header{border-bottom:2px solid #222;padding-bottom:10px;margin-bottom:8px}
+.sub{color:var(--fg-soft);margin:0 0 2px} .muted{font-size:12px;margin:2px 0}
+header{border-bottom:2px solid var(--fg);padding-bottom:10px;margin-bottom:8px}
 section{margin:26px 0}
-.unit{color:#888;font-size:11px;font-style:italic;margin:0 0 4px}
-table{width:100%;border-collapse:collapse;font-size:13px;margin:4px 0}
-th,td{border-bottom:1px solid #eee;padding:5px 8px;text-align:right} th:first-child,td:first-child{text-align:left}
-th{color:#888;font-weight:600;border-bottom:1px solid #bbb}
-tr.sub td{font-weight:700;border-top:1px solid #ccc}
+.unit{color:var(--muted);font-size:11px;font-style:italic;margin:0 0 4px}
+table{font-size:13px;margin:4px 0}
+th{border-bottom:1px solid var(--border)}
+tr.sub td{font-weight:700;border-top:1px solid var(--border)}
 td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
-.note{margin:10px 0} .note p{margin:3px 0;color:#333}
-.cat{display:inline-block;background:#eef6ff;border:1px solid #cfe3ff;border-radius:6px;padding:0 6px;font-size:11px;color:#36c}
+.note{margin:10px 0} .note p{margin:3px 0}
 @media print{section{page-break-inside:avoid} h2{page-break-after:avoid} body{margin:0}}
 """
 
@@ -124,8 +126,9 @@ def render_statements_html(filing: dict) -> str:
         audit_line = "Auditor: " + " — ".join(str(p) for p in [audit.get("auditor_name"),
                                                                 audit.get("opinion_type")] if p) + ". "
     out = [
-        "<!doctype html><html><head><meta charset='utf-8'>",
-        f"<title>{E(str(name))} — financial statements</title><style>{_CSS}</style></head><body>",
+        "<!doctype html><html lang='en'><head><meta charset='utf-8'>",
+        f"<title>{E(str(name))} — financial statements</title>"
+        f"<style>{qscreen_ui.css()}{_CSS}</style></head><body>",
         f"<header><h1>{E(str(name))}</h1><p class='sub'>{E(sub)}</p>",
         f"<p class='muted'>{E(audit_line)}Figures in {unit_note}"
         + (f". Source: {E(str(meta['source_file']))}" if meta.get("source_file") else "")

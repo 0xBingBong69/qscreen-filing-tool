@@ -70,9 +70,9 @@ def _cfg():
 
 def test_extract_error_does_not_leak_traceback(client, monkeypatch):
     monkeypatch.setattr(app_mod.engine, "resolve_provider", lambda args: _cfg())
-    monkeypatch.setattr(app_mod.engine, "pdf_to_pages", lambda path: ([{"num": 1, "text": "x"}], "sha"))
+    monkeypatch.setattr(app_mod.engine, "pdf_to_pages", lambda path, progress_cb=None: ([{"num": 1, "text": "x"}], "sha"))
 
-    def boom(pages, args):
+    def boom(pages, args, progress_cb=None):
         raise ValueError('parse failed near /home/secret/path line 42')
     monkeypatch.setattr(app_mod.engine, "extract_filing", boom)
 
@@ -88,8 +88,8 @@ def test_extract_error_does_not_leak_traceback(client, monkeypatch):
 
 def test_extract_strips_path_from_source_file(client, monkeypatch):
     monkeypatch.setattr(app_mod.engine, "resolve_provider", lambda args: _cfg())
-    monkeypatch.setattr(app_mod.engine, "pdf_to_pages", lambda path: ([{"num": 1, "text": "x"}], "sha"))
-    monkeypatch.setattr(app_mod.engine, "extract_filing", lambda pages, args: _statement_filing())
+    monkeypatch.setattr(app_mod.engine, "pdf_to_pages", lambda path, progress_cb=None: ([{"num": 1, "text": "x"}], "sha"))
+    monkeypatch.setattr(app_mod.engine, "extract_filing", lambda pages, args, progress_cb=None: _statement_filing())
 
     r = client.post("/extract", data={"symbol": "QNBK", "subsector": "Commercial Bank",
                                        "year": "2024", "period": "FY",

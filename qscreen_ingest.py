@@ -485,7 +485,46 @@ def _ocr_pages(pdf_path: str, page_numbers: list[int]) -> dict[int, str]:
     return out
 
 
-def pdf_to_pages(pdf_path: str, ocr_mode: str = "auto") -> tuple[list[dict], str]:
+_ANSI = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "cyan": "36"}
+
+
+def _color(s: str, name: str) -> str:
+    """Wrap text in an ANSI color, but only for an interactive terminal.
+
+    A no-op when stdout is piped/redirected, when NO_COLOR is set
+    (https://no-color.org), or when --no-color set ``_color.off`` — so piped
+    logs and captured output stay plain text.
+    """
+    if getattr(_color, "off", False) or os.getenv("NO_COLOR") or not sys.stdout.isatty():
+        return s
+    return f"\033[{_ANSI.get(name, '0')}m{s}\033[0m"
+
+
+def _say(*args, **kwargs) -> None:
+    """A print() the --quiet flag (which sets ``_say.quiet``) can silence. Used
+    only for the chatty per-window progress lines — never for headline status
+    or results, which always print."""
+    if not getattr(_say, "quiet", False):
+        print(*args, **kwargs)
+
+
+def _emit(cb, **ev) -> None:
+    """Fire a structured progress event to an optional callback.
+
+    Best-effort by design: progress reporting must never sink an extraction, so
+    a raising callback is swallowed. cb=None (the default at every call site,
+    including the whole CLI) reproduces the prior behavior exactly. Events look
+    like {"stage": "reading_pdf"|"extracting"|"assembling"|"validating",
+    "window": int, "total": int, "message": str}.
+    """
+    if cb:
+        try:
+            cb(ev)
+        except Exception:
+            pass
+
+
+def pdf_to_pages(pdf_path: str, ocr_mode: str = "auto", progress_cb=None) -> tuple[list[dict], str]:
     """Extract per-page text (+ recovered tables). ocr_mode: auto|never|always.
 
     auto   — OCR only pages that pdfplumber returned (almost) no text for.
@@ -503,6 +542,7 @@ def pdf_to_pages(pdf_path: str, ocr_mode: str = "auto") -> tuple[list[dict], str
             if rendered:
                 text = f"{text}\n\n[TABLES on page {page_num}]\n{rendered}"
             pages.append({"num": page_num, "text": text})
+    _emit(progress_cb, stage="reading_pdf", total=len(pages), message=f"{len(pages)} pages")
 
     if ocr_mode == "always":
         targets = [p["num"] for p in pages]
@@ -1781,7 +1821,7 @@ def guided_extract_notes(chunk: str, args) -> list[dict]:
     return notes
 
 
-def extract_filing_guided(pages: list[dict], args) -> dict:
+def extract_filing_guided(pages: list[dict], args, progress_cb=None) -> dict:
     """Basic mode: deterministic-first extraction for small / local models.
 
     For each small window it (1) reads line items straight from the PDF's
@@ -1803,6 +1843,8 @@ def extract_filing_guided(pages: list[dict], args) -> dict:
 
     parts: list[dict] = []
     for wi, win in enumerate(windows, 1):
+        _emit(progress_cb, stage="extracting", window=wi, total=len(windows),
+              message=f"pages {win[0]['num']}-{win[-1]['num']}")
         text = render_window(win)
         part = empty_filing()
         scale = detect_unit_scale(text)
@@ -1827,7 +1869,7 @@ def extract_filing_guided(pages: list[dict], args) -> dict:
                         "verbatim_text": chunk or text, "line_items": items,
                     })
         names = ", ".join(f"{s['type']}×{len(s['line_items'])}" for s in part["statements"]) or "—"
-        print(f"   • window {wi}/{len(windows)} (pages {win[0]['num']}-{win[-1]['num']}): {names}")
+        _say(f"   • window {wi}/{len(windows)} (pages {win[0]['num']}-{win[-1]['num']}): {names}")
 
         # audit: deterministic opinion first, then a closed-set model ask
         if _AUDIT_HINT.search(text):
@@ -1852,6 +1894,7 @@ def extract_filing_guided(pages: list[dict], args) -> dict:
         eq["confidence"] = round(0.6 + 0.39 * (n_parsed / len(all_li)), 2)
     print(f"🧩 Assembled {len(merged.get('statements', []))} statement(s); {note}; "
           f"{n_codes} mapped to account codes.")
+    _emit(progress_cb, stage="assembling", message=note)
     return merged
 
 
@@ -1885,18 +1928,20 @@ def apply_mode(args) -> None:
 
 # ── Orchestration ─────────────────────────────────────────────────────────────
 
-def extract_filing(pages: list[dict], args) -> dict:
+def extract_filing(pages: list[dict], args, progress_cb=None) -> dict:
     if getattr(args, "guided", False):
-        return extract_filing_guided(pages, args)
+        return extract_filing_guided(pages, args, progress_cb)
     if args.no_chunk or len(pages) <= args.pages_per_chunk:
         print("🤖 Extracting (single pass) …")
+        _emit(progress_cb, stage="extracting", window=1, total=1, message="single pass")
         return normalize_filing(parse_llm_json(call_llm(build_messages(render_window(pages), args, windowed=False), args)))
     windows = page_windows(pages, args.pages_per_chunk, args.overlap)
     print(f"🤖 Extracting in {len(windows)} windows of ~{args.pages_per_chunk} pages (overlap {args.overlap}) …")
     parts = []
     for wi, win in enumerate(windows, 1):
         hint = f"pages {win[0]['num']}-{win[-1]['num']}"
-        print(f"   • window {wi}/{len(windows)} ({hint})")
+        _emit(progress_cb, stage="extracting", window=wi, total=len(windows), message=hint)
+        _say(f"   • window {wi}/{len(windows)} ({hint})")
         raw = call_llm(build_messages(render_window(win), args, windowed=True, page_hint=hint), args)
         try:
             parts.append(normalize_filing(parse_llm_json(raw)))
@@ -1905,6 +1950,7 @@ def extract_filing(pages: list[dict], args) -> dict:
     if not parts:
         raise SystemExit("all windows failed to parse — nothing extracted")
     print(f"🧩 Merging {len(parts)} partial extracts …")
+    _emit(progress_cb, stage="assembling", message=f"merging {len(parts)} parts")
     return merge_filings(parts)
 
 
@@ -2079,6 +2125,29 @@ def write_outputs(filing: dict, args) -> tuple[list[str], dict | None]:
     return written, artifacts
 
 
+def _cli_progress(args):
+    """Build a progress callback for a CLI run: JSONL on stderr (--json), a
+    single rewriting status line on stderr (--quiet), or None (the default — the
+    engine's own per-window prints carry the detail)."""
+    if getattr(args, "json_status", False):
+        def cb(ev):
+            sys.stderr.write(json.dumps(ev) + "\n")
+            sys.stderr.flush()
+        return cb
+    if getattr(args, "quiet", False):
+        def cb(ev):
+            w, t = ev.get("window"), ev.get("total")
+            tail = f" {w}/{t}" if w and t else ""
+            msg = f" · {ev['message']}" if ev.get("message") else ""
+            sys.stderr.write(f"\r  … {ev.get('stage', '')}{tail}{msg}        ")
+            sys.stderr.flush()
+            if ev.get("stage") == "assembling":
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+        return cb
+    return None
+
+
 def run_filing(args) -> int:
     """Extract one PDF → save (+ optional export) → optionally upload. Returns
     an exit code: 0 ok, 2 saved-but-non-conforming (not uploaded)."""
@@ -2102,16 +2171,17 @@ def run_filing(args) -> int:
                   f"{len(args._profile.get('active_events') or [])} regime/event(s) in force by {args.year}")
     mode = ("basic — deterministic, no model" if no_llm
             else "basic (deterministic-first)" if args.guided else "pro (single big prompt)")
-    print(f"📄 Reading {Path(args.pdf).name} …  (provider: {cfg['name']}, model: {cfg['model']}, "
-          f"mode: {mode})")
+    print(_color(f"📄 Reading {Path(args.pdf).name} …  (provider: {cfg['name']}, model: {cfg['model']}, "
+                 f"mode: {mode})", "bold"))
     if not args.guided and cfg.get("local"):
         print("   ⚠️  Pro mode leans on the model heavily — for best results use a strong model "
               "(GPT-4.5+/Claude Sonnet 4+/MiniMax-M2), or switch to Basic (--basic) for this small one.")
-    pages, sha = pdf_to_pages(args.pdf, args.ocr)
+    progress = _cli_progress(args)
+    pages, sha = pdf_to_pages(args.pdf, args.ocr, progress_cb=progress)
     total_chars = sum(len(pg["text"]) for pg in pages)
     print(f"   {len(pages)} pages, {total_chars:,} chars (text + recovered tables), sha256={sha[:12]}…")
 
-    filing = extract_filing(pages, args)
+    filing = extract_filing(pages, args, progress)
     filing.setdefault("metadata", {}).update({
         "symbol": args.symbol.upper(), "sector": args.sector,
         "fiscal_year": args.year, "fiscal_period": args.period,
@@ -2120,12 +2190,13 @@ def run_filing(args) -> int:
         "extractor": {"provider": cfg["name"], "model": cfg["model"]},
     })
 
-    print(f"📊 Extracted: {len(filing.get('statements', []))} statements, "
-          f"{len(filing.get('notes', []))} notes, audit={filing.get('audit', {}).get('opinion_type')}")
+    print(_color(f"📊 Extracted: {len(filing.get('statements', []))} statements, "
+                 f"{len(filing.get('notes', []))} notes, "
+                 f"audit={filing.get('audit', {}).get('opinion_type')}", "bold"))
 
     problems = validate_filing(filing)
     if problems:
-        print(f"⚠️  {len(problems)} contract problem(s):")
+        print(_color(f"⚠️  {len(problems)} contract problem(s):", "yellow"))
         for pr in problems[:25]:
             print(f"   - {pr}")
         print("   (saved for inspection; NOT uploading a non-conforming extract)")
@@ -2134,7 +2205,7 @@ def run_filing(args) -> int:
     _written, artifacts = write_outputs(filing, args)
 
     if problems:
-        print("❌ Not uploading — fix extraction problems above first.")
+        print(_color("❌ Not uploading — fix extraction problems above first.", "red"))
         return 2
     if args.dry_run:
         print("📤 --dry-run — saved only, not uploaded.")
@@ -2145,7 +2216,7 @@ def run_filing(args) -> int:
 
     fold = (artifacts or {}).get("analysis") if getattr(args, "with_analysis", False) else None
     print("📤 Uploading to qscreen.app …" + (" (with analysis)" if fold else ""))
-    print(f"   ✅ {upload_filing(filing, args, fold)}")
+    print(_color(f"   ✅ {upload_filing(filing, args, fold)}", "green"))
     return 0
 
 
@@ -2254,7 +2325,18 @@ def main() -> int:
     p.add_argument("--token", default=os.getenv("INGEST_TOKEN"))
     p.add_argument("--dry-run", action="store_true", help="Extract + save, but do not upload")
     p.add_argument("--self-test", action="store_true", help="Validate contract/normalize/merge offline and exit")
+    p.add_argument("--quiet", action="store_true",
+                   help="Collapse the per-window progress chatter into one status line (on stderr)")
+    p.add_argument("--json", dest="json_status", action="store_true",
+                   help="Emit structured progress events as JSON lines on stderr (for scripting)")
+    p.add_argument("--no-color", action="store_true",
+                   help="Disable ANSI colors (auto-off when piped or when NO_COLOR is set)")
     args = p.parse_args()
+
+    if args.no_color:
+        _color.off = True
+    if args.quiet:
+        _say.quiet = True
 
     if args.list_providers:
         print(list_providers())

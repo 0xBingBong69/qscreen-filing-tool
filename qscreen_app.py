@@ -21,9 +21,11 @@ from __future__ import annotations
 import io
 import json
 import os
+import queue
 import re
 import sys
 import tempfile
+import threading
 import traceback
 from types import SimpleNamespace
 from pathlib import Path
@@ -37,9 +39,10 @@ import qscreen_portfolio
 import qscreen_workbook
 import qscreen_statements
 import qscreen_periods
+import qscreen_ui
 
 try:
-    from flask import Flask, request, Response, send_file
+    from flask import Flask, request, Response, send_file, stream_with_context
 except ImportError:
     sys.exit("Flask not installed. Run:  pip install flask pdfplumber requests")
 
@@ -77,66 +80,75 @@ def _subsector_options_html() -> str:
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>QScreen Filing Ingestor</title>
 <style>
-  body { font: 15px/1.5 system-ui, sans-serif; max-width: 720px; margin: 40px auto; padding: 0 16px; color: #1a1a1a; }
-  h1 { font-size: 22px; } .sub { color: #666; margin-top: -8px; }
+  __UI_CSS__
+  body { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+  .topbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  h1 { font-size: 22px; margin: 0; } .sub { color: var(--fg-soft); margin: 4px 0 18px; }
+  #themetoggle { background: var(--card); color: var(--fg); border: 1px solid var(--border); border-radius: 999px; padding: 7px 13px; font-size: 13px; font-weight: 600; white-space: nowrap; }
   label { display: block; margin: 14px 0 4px; font-weight: 600; }
-  input, select { width: 100%; padding: 9px; border: 1px solid #ccc; border-radius: 6px; font-size: 15px; box-sizing: border-box; }
-  .row { display: flex; gap: 12px; } .row > div { flex: 1; }
-  button { margin-top: 20px; padding: 12px 20px; font-size: 16px; font-weight: 600; background: #0b6; color: #fff; border: 0; border-radius: 8px; cursor: pointer; }
-  button:disabled { background: #999; cursor: wait; }
-  #out { white-space: pre-wrap; background: #f6f6f6; border: 1px solid #e0e0e0; border-radius: 8px; padding: 14px; margin-top: 20px; display: none; }
-  .ok { color: #0a7; } .warn { color: #c80; } .err { color: #c33; }
-  .hint { color: #888; font-size: 13px; margin: 6px 0 0; min-height: 16px; }
-  a.dl { display: inline-block; margin-top: 14px; margin-right: 8px; padding: 10px 16px; background: #06c; color: #fff; border-radius: 8px; text-decoration: none; font-weight: 600; }
-  a.up { background: #0b6; } a.up.busy { background: #999; pointer-events: none; }
-  .muted { color: #888; font-weight: 400; font-size: 12px; }
-  details.adv { margin-top: 14px; } summary { cursor: pointer; color: #06c; font-weight: 600; }
-  .keyhint { background: #eef6ff; border: 1px solid #cfe3ff; border-radius: 8px; padding: 10px 12px; margin-top: 10px; font-size: 13px; line-height: 1.5; }
-  .keyhint a { color: #06c; font-weight: 700; } .keyhint code { background: #dceaff; padding: 1px 5px; border-radius: 4px; }
+  input, select { width: 100%; padding: 9px; border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 15px; background: var(--bg); color: var(--fg); }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; } .row > div { flex: 1; min-width: 150px; }
+  .drop { position: relative; display: flex; flex-direction: column; align-items: center; gap: 4px; text-align: center; padding: 26px 16px; border: 2px dashed var(--border); border-radius: var(--radius); background: var(--card); color: var(--fg-soft); cursor: pointer; transition: border-color .15s, background .15s; }
+  .drop:hover, .drop:focus-visible { border-color: var(--accent); }
+  .drop.over { border-color: var(--accent); background: var(--accent-bg); color: var(--fg); }
+  .drop strong { color: var(--fg); } .drop .big { font-size: 26px; line-height: 1; }
+  .drop input[type=file] { position: absolute; width: 1px; height: 1px; opacity: 0; }
+  button.go { margin-top: 20px; padding: 12px 20px; font-size: 16px; font-weight: 600; background: var(--ok); color: #fff; border: 0; border-radius: var(--radius); width: 100%; }
+  button.go:disabled { background: var(--muted); cursor: wait; }
+  #prog { width: 100%; height: 10px; margin-top: 14px; display: none; }
+  #progmsg { color: var(--fg-soft); font-size: 13px; margin: 6px 0 0; min-height: 16px; }
+  #out { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-top: 18px; display: none; }
+  .banner { display: flex; gap: 9px; align-items: flex-start; font-weight: 600; padding: 11px 13px; border: 1px solid var(--border); border-left-width: 4px; border-radius: var(--radius-sm); }
+  .banner.ok { border-left-color: var(--pos); } .banner.warn { border-left-color: var(--warn); } .banner.err { border-left-color: var(--err); }
+  .banner .ic { font-size: 17px; line-height: 1.25; }
+  .notes { margin: 8px 0 0; padding-left: 18px; color: var(--fg-soft); font-size: 13px; font-weight: 400; }
+  .hint { color: var(--muted); font-size: 13px; margin: 6px 0 0; min-height: 16px; }
+  a.dl { display: inline-block; margin: 8px 8px 0 0; padding: 10px 16px; background: var(--accent); color: #fff; border-radius: var(--radius); text-decoration: none; font-weight: 600; }
+  a.up { background: var(--ok); } a.up.busy { background: var(--muted); pointer-events: none; }
+  details.adv { margin-top: 14px; } summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+  .keyhint { background: var(--accent-bg); border: 1px solid var(--accent-border); border-radius: var(--radius); padding: 10px 12px; margin-top: 10px; font-size: 13px; line-height: 1.5; }
+  .keyhint a { color: var(--accent); font-weight: 700; } .keyhint code { background: var(--accent-border); padding: 1px 5px; border-radius: 4px; }
   label.guided { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 13px; font-weight: 600; }
   label.guided input { width: auto; }
-  .seg { margin-top: 18px; } .seg h3 { font-size: 16px; margin: 8px 0; } .seg h4 { font-size: 13px; color: #555; text-transform: capitalize; margin: 12px 0 4px; }
-  table.seg { width: 100%; border-collapse: collapse; font-size: 13px; }
-  table.seg th, table.seg td { border-bottom: 1px solid #eee; padding: 5px 8px; text-align: right; }
-  table.seg th:first-child, table.seg td:first-child { text-align: left; }
-  table.seg th { color: #888; font-weight: 600; }
-  .fx { background: #fde8c8; color: #a05a00; border-radius: 4px; padding: 0 5px; font-size: 11px; font-weight: 700; }
-  .ev { color: #06c; cursor: help; }
-  .neg { color: #c33; } .pos { color: #0a7; }
-  .rep { color: #0a7; cursor: help; font-size: 11px; } ul.flags { margin: 6px 0; padding-left: 0; list-style: none; }
-  ul.flags li { padding: 4px 0; font-size: 13px; } ul.flags li.alert { color: #c33; font-weight: 600; } ul.flags li.warn2 { color: #b06b00; }
+  .seg { margin-top: 18px; } .seg h3 { font-size: 16px; margin: 8px 0; } .seg h4 { font-size: 13px; color: var(--fg-soft); text-transform: capitalize; margin: 12px 0 4px; }
+  table.seg, table.cmp { font-size: 13px; } table.cmp { margin-top: 8px; }
+  table.cmp tr.target { background: var(--accent-bg); font-weight: 600; } table.cmp .r1 { color: var(--pos); font-weight: 700; }
+  table.cmp sup { color: var(--muted); font-weight: 400; }
   .dcf label { display: inline-block; font-weight: 600; font-size: 12px; margin: 6px 8px 2px 0; }
   .dcf input { width: 78px; padding: 5px; font-size: 13px; }
-  .dcf button { margin: 8px 0; padding: 8px 14px; font-size: 14px; }
-  .dcfval { font-size: 18px; font-weight: 700; } .grid td.base { background: #fff3cd; font-weight: 700; }
-  details.cmp { margin-top: 22px; border-top: 1px solid #eee; padding-top: 12px; } details.cmp summary { cursor: pointer; font-weight: 600; }
-  table.cmp { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 8px; }
-  table.cmp th, table.cmp td { border-bottom: 1px solid #eee; padding: 5px 8px; text-align: right; }
-  table.cmp th:first-child, table.cmp td:first-child { text-align: left; }
-  table.cmp tr.target { background: #eef6ff; font-weight: 600; } table.cmp .r1 { color: #0a7; font-weight: 700; }
-  table.cmp sup { color: #999; font-weight: 400; }
-  label.inc { font-size: 12px; color: #555; margin-left: 10px; } label.inc input { vertical-align: middle; }
-  .outputs { margin: 14px 0 4px; padding-top: 10px; border-top: 1px solid #eee; }
-  .olabel { display: block; font-weight: 600; color: #555; font-size: 13px; margin-bottom: 6px; }
-</style></head><body>
-<h1>QScreen Filing Ingestor</h1>
+  details.cmp button, .dcf button { background: var(--accent); color: #fff; border: 0; border-radius: var(--radius-sm); padding: 8px 14px; font-size: 14px; font-weight: 600; margin: 8px 6px 0 0; }
+  .dcfval { font-size: 18px; font-weight: 700; } .grid td.base { background: var(--base-cell); font-weight: 700; }
+  details.cmp { margin-top: 22px; border-top: 1px solid var(--border-soft); padding-top: 12px; } details.cmp summary { cursor: pointer; font-weight: 600; }
+  label.inc { font-size: 12px; color: var(--fg-soft); margin-left: 10px; font-weight: 600; } label.inc input { vertical-align: middle; width: auto; }
+  .outputs { margin: 14px 0 4px; padding-top: 10px; border-top: 1px solid var(--border-soft); }
+  .olabel { display: block; font-weight: 600; color: var(--fg-soft); font-size: 13px; margin-bottom: 6px; }
+</style>
+<script>(function(){try{var t=localStorage.getItem('qscreen-theme');var c=document.documentElement.classList;
+  if(t==='dark')c.add('theme-dark');else if(t==='light')c.add('theme-light');}catch(e){}})();</script>
+</head><body>
+<div class="topbar"><h1>QScreen Filing Ingestor</h1>
+  <button type="button" id="themetoggle" aria-label="Toggle dark mode" aria-pressed="false">🌙 Dark</button></div>
 <p class="sub">Drop a QSE financial-report PDF, fill the fields, click Extract. Then download the report and upload it to qscreen.app. Type a known symbol and the sub-sector auto-fills.</p>
 <form id="f">
-  <label>Filing PDF</label>
-  <input type="file" name="pdf" accept="application/pdf" required>
+  <label for="pdf">Filing PDF</label>
+  <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose or drop a PDF file">
+    <span class="big" aria-hidden="true">📄</span>
+    <span id="dropmsg"><strong>Drop a PDF here</strong> or click to browse</span>
+    <input type="file" id="pdf" name="pdf" accept="application/pdf" required>
+  </div>
   <div class="row">
-    <div><label>Symbol</label><input name="symbol" id="symbol" placeholder="QIBK" autocomplete="off" required></div>
-    <div><label>QSE Sector / Sub-sector</label>
+    <div><label for="symbol">Symbol</label><input name="symbol" id="symbol" placeholder="QIBK" autocomplete="off" required></div>
+    <div><label for="subsector">QSE Sector / Sub-sector</label>
       <select name="subsector" id="subsector" required>
         __SUBSECTOR_OPTIONS__
       </select>
     </div>
   </div>
-  <p class="hint" id="hint"></p>
+  <p class="hint" id="hint" aria-live="polite"></p>
   <div class="row">
-    <div><label>Year</label><input name="year" type="number" placeholder="2024" required></div>
-    <div><label>Period</label>
-      <select name="period">
+    <div><label for="year">Year</label><input name="year" id="year" type="number" placeholder="2024" required></div>
+    <div><label for="period">Period</label>
+      <select name="period" id="period">
         <option>FY</option><option>Q1</option><option>Q2</option><option>Q3</option>
         <option>Q4</option><option>H1</option><option>9M</option>
       </select>
@@ -144,7 +156,7 @@ PAGE = """<!doctype html>
   </div>
   <details class="adv" open><summary>Provider / model — cloud key OR a local model on your laptop</summary>
     <div class="row">
-      <div><label>AI Provider</label>
+      <div><label for="provider">AI Provider</label>
         <select name="provider" id="provider">
           <option value="">auto (use whichever key is set)</option>
           <optgroup label="Cloud (needs an API key)">
@@ -164,12 +176,12 @@ PAGE = """<!doctype html>
           </optgroup>
         </select>
       </div>
-      <div><label>Model <span class="muted">(blank = provider default)</span></label>
+      <div><label for="model">Model <span class="muted">(blank = provider default)</span></label>
         <input name="model" id="model" placeholder="default" autocomplete="off"></div>
     </div>
     <p class="keyhint" id="provkey"></p>
     <div class="row">
-      <div><label>Mode</label>
+      <div><label for="mode">Mode</label>
         <select name="mode" id="mode">
           <option value="auto">Auto (Basic for local, Pro for cloud)</option>
           <option value="basic">Basic — deterministic, great for tiny / local models</option>
@@ -182,16 +194,22 @@ PAGE = """<!doctype html>
       <span class="muted">(Basic; needs no key)</span></label>
     <p class="keyhint" id="modehint"></p>
   </details>
-  <button type="submit" id="go">Extract</button>
+  <button type="submit" id="go" class="go">Extract</button>
+  <progress id="prog" max="100" value="0" aria-label="Extraction progress"></progress>
+  <p id="progmsg" aria-live="polite"></p>
 </form>
-<div id="out"></div>
+<section id="out" role="status" aria-live="polite"></section>
 
 <details class="cmp"><summary>Compare / screen extracted filings</summary>
-  <p class="muted">Select already-extracted <code>*_filing.json</code> files.
+  <p class="muted">Reuse the filings you extracted this session and/or add saved
+  <code>*_filing.json</code> files.
   <b>Compare</b> ranks them as peers (on the first file's company type);
   <b>Dashboard</b> screens the whole basket; <b>Excel workbook</b> combines several
   years of one company into a single multi-year transcript; <b>TTM</b> rolls interim
   (YTD) filings into a trailing-twelve-month view.</p>
+  <label class="guided"><input type="checkbox" id="usesession" checked>
+    <span id="sesslabel">No filings extracted yet this session</span></label>
+  <label for="cmpfiles">…or add saved filing JSON files</label>
   <input type="file" id="cmpfiles" accept="application/json,.json" multiple>
   <button id="cmpgo" type="button">Compare</button>
   <button id="dashgo" type="button">Dashboard</button>
@@ -231,7 +249,7 @@ function updateProvider() {
 function updateMode() {
   if (!modeHint) return;
   if (noLlmEl && noLlmEl.checked) {
-    modeHint.innerHTML = '⚙️ <b>Fully offline.</b> Line items are read straight from the PDF\'s tables — ' +
+    modeHint.innerHTML = '⚙️ <b>Fully offline.</b> Line items are read straight from the PDF tables — ' +
       'no model is called. Audit/notes are skipped. Works with no key and no model running.';
     return;
   }
@@ -240,7 +258,7 @@ function updateMode() {
     modeHint.innerHTML = '🧠 <b>Pro.</b> The model extracts everything (richer notes & segments). ' +
       'Use a strong model — GPT‑4.5+/Claude Sonnet 4+/MiniMax‑M2.';
   } else if (m === 'basic') {
-    modeHint.innerHTML = '🧭 <b>Basic.</b> Numbers are read from the PDF\'s tables in code; the model only ' +
+    modeHint.innerHTML = '🧭 <b>Basic.</b> Numbers are read from the PDF tables in code; the model only ' +
       'fills gaps and classifies the audit opinion. Great for a tiny / local model (e.g. Gemma 3 270M via MLX).';
   } else {
     modeHint.innerHTML = '🧭 <b>Auto.</b> Basic for local models, Pro for cloud models.';
@@ -250,6 +268,53 @@ if (provEl) { provEl.addEventListener('change', updateProvider); }
 if (modeEl) { modeEl.addEventListener('change', updateMode); }
 if (noLlmEl) { noLlmEl.addEventListener('change', updateMode); }
 updateProvider();
+
+// ── dark / light theme toggle (persisted; applied pre-paint in <head>) ────────
+const themeBtn = document.getElementById('themetoggle');
+function currentTheme(){ const c = document.documentElement.classList;
+  return c.contains('theme-dark') ? 'dark' : (c.contains('theme-light') ? 'light'
+    : ((window.matchMedia && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light')); }
+function syncThemeBtn(){ const dark = currentTheme() === 'dark';
+  themeBtn.textContent = dark ? '☀️ Light' : '🌙 Dark';
+  themeBtn.setAttribute('aria-pressed', dark ? 'true' : 'false'); }
+themeBtn.onclick = () => {
+  const dark = currentTheme() === 'dark', c = document.documentElement.classList;
+  c.remove('theme-dark', 'theme-light'); c.add(dark ? 'theme-light' : 'theme-dark');
+  try { localStorage.setItem('qscreen-theme', dark ? 'light' : 'dark'); } catch (e) {}
+  syncThemeBtn();
+};
+syncThemeBtn();
+
+// ── drag & drop PDF (the bare file input is visually hidden inside .drop) ──────
+const drop = document.getElementById('drop'), pdfIn = document.getElementById('pdf'),
+      dropMsg = document.getElementById('dropmsg');
+function showFile(){ const file = pdfIn.files && pdfIn.files[0];
+  dropMsg.innerHTML = file ? ('<strong>' + esc(file.name) + '</strong> · ' + (file.size / 1048576).toFixed(1) + ' MB')
+                           : '<strong>Drop a PDF here</strong> or click to browse'; }
+drop.onclick = () => pdfIn.click();
+drop.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pdfIn.click(); } };
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+drop.addEventListener('dragleave', e => { if (!drop.contains(e.relatedTarget)) drop.classList.remove('over'); });
+drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over');
+  if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) { pdfIn.files = e.dataTransfer.files; showFile(); } });
+pdfIn.addEventListener('change', showFile);
+
+// ── in-session memory: reuse just-extracted filings in Compare/Dashboard/TTM ──
+let sessionFilings = [];
+function rememberFiling(name, filing, analysis){
+  sessionFilings.push({ name: name, filing: filing, analysis: analysis || null });
+  updateSessionLabel();
+}
+function updateSessionLabel(){ const el = document.getElementById('sesslabel');
+  if (el) el.textContent = sessionFilings.length
+    ? ("Include this session's " + sessionFilings.length + " extracted filing(s)")
+    : "No filings extracted yet this session"; }
+function gatherFilings(picked){
+  const useSess = document.getElementById('usesession');
+  const sess = (useSess && useSess.checked) ? sessionFilings.map(s => s.filing) : [];
+  return sess.concat(picked || []);
+}
+updateSessionLabel();
 
 function fmtNum(x){ return (x==null)?'—':Number(x).toLocaleString(); }
 function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -293,22 +358,26 @@ function renderCompare(d){
   }
   return h + '</table><p class="muted">★ = target · #n = rank among peers · green = best</p>';
 }
+async function pickedFilings(){
+  const inp = document.getElementById('cmpfiles');
+  return Promise.all([...(inp.files || [])].map(f => f.text().then(t => JSON.parse(t))));
+}
 async function runCompare(){
-  const inp = document.getElementById('cmpfiles'), out = document.getElementById('cmpout');
-  if(!inp.files || inp.files.length < 2){ out.innerHTML='<span class="warn">Pick at least two filing JSON files.</span>'; return; }
+  const out = document.getElementById('cmpout');
   out.textContent = 'Comparing…';
   try {
-    const filings = await Promise.all([...inp.files].map(f => f.text().then(t => JSON.parse(t))));
+    const filings = gatherFilings(await pickedFilings());
+    if(filings.length < 2){ out.innerHTML='<span class="warn">Need at least two filings — extract some this session, or add JSON files.</span>'; return; }
     const r = await fetch('/compare', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({filings})});
     out.innerHTML = renderCompare(await r.json());
   } catch(e){ out.innerHTML = '<span class="err">'+esc(e)+'</span>'; }
 }
 async function runDashboard(){
-  const inp = document.getElementById('cmpfiles'), out = document.getElementById('cmpout');
-  if(!inp.files || !inp.files.length){ out.innerHTML='<span class="warn">Pick filing JSON files.</span>'; return; }
+  const out = document.getElementById('cmpout');
   out.textContent = 'Screening…';
   try {
-    const filings = await Promise.all([...inp.files].map(f => f.text().then(t => JSON.parse(t))));
+    const filings = gatherFilings(await pickedFilings());
+    if(!filings.length){ out.innerHTML='<span class="warn">No filings — extract some this session, or add JSON files.</span>'; return; }
     const r = await fetch('/portfolio', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({filings})});
     const d = await r.json(); if(!r.ok) throw new Error(d.error||'failed');
     const url = URL.createObjectURL(new Blob([d.html], {type:'text/html'}));
@@ -317,11 +386,11 @@ async function runDashboard(){
   } catch(e){ out.innerHTML = '<span class="err">'+esc(e)+'</span>'; }
 }
 async function runTtm(){
-  const inp = document.getElementById('cmpfiles'), out = document.getElementById('cmpout');
-  if(!inp.files || !inp.files.length){ out.innerHTML='<span class="warn">Pick filing JSON files (one company, annual and/or interim).</span>'; return; }
+  const out = document.getElementById('cmpout');
   out.textContent = 'Rolling up…';
   try {
-    const filings = await Promise.all([...inp.files].map(f => f.text().then(t => JSON.parse(t))));
+    const filings = gatherFilings(await pickedFilings());
+    if(!filings.length){ out.innerHTML='<span class="warn">No filings (one company, annual and/or interim) — extract some, or add JSON files.</span>'; return; }
     const r = await fetch('/ttm', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({filings})});
     const d = await r.json(); if(!r.ok) throw new Error(d.error||'failed');
     function tbl(obj){ const rows = Object.entries(obj||{}).sort(); if(!rows.length) return '<p class="muted">—</p>';
@@ -334,11 +403,11 @@ async function runTtm(){
   } catch(e){ out.innerHTML = '<span class="err">'+esc(e)+'</span>'; }
 }
 async function runWorkbook(){
-  const inp = document.getElementById('cmpfiles'), out = document.getElementById('cmpout');
-  if(!inp.files || !inp.files.length){ out.innerHTML='<span class="warn">Pick filing JSON files (same company, multiple years).</span>'; return; }
+  const out = document.getElementById('cmpout');
   out.textContent = 'Building workbook…';
   try {
-    const filings = await Promise.all([...inp.files].map(f => f.text().then(t => JSON.parse(t))));
+    const filings = gatherFilings(await pickedFilings());
+    if(!filings.length){ out.innerHTML='<span class="warn">No filings (same company, multiple years) — extract some, or add JSON files.</span>'; return; }
     const r = await fetch('/workbook', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({filings})});
     if(!r.ok){ const d = await r.json().catch(()=>({})); throw new Error(d.error||'failed'); }
     const url = URL.createObjectURL(await r.blob());
@@ -425,110 +494,177 @@ symbolEl.addEventListener('input', () => {
   }
 });
 let lastBlob = null, lastName = 'filing.json', lastFiling = null, lastSymbol = '', lastAnalysis = null;
+
+const STAGE_LABEL = { reading_pdf: 'Reading the PDF', extracting: 'Extracting statements',
+                      assembling: 'Assembling the filing', validating: 'Checking the contract' };
+function setProgress(pct, msg){
+  const p = document.getElementById('prog'), m = document.getElementById('progmsg');
+  if (p) { p.style.display = 'block'; if (pct == null) p.removeAttribute('value'); else p.value = pct; }
+  if (m) m.textContent = msg || '';
+}
+function clearProgress(){ const p = document.getElementById('prog'), m = document.getElementById('progmsg');
+  if (p) p.style.display = 'none'; if (m) m.textContent = ''; }
+function onProgress(ev){
+  if (ev.stage === 'extracting' && ev.total)
+    setProgress(Math.min(92, Math.round(ev.window / ev.total * 92)),
+      'Extracting — window ' + ev.window + ' of ' + ev.total + (ev.message ? (' · ' + ev.message) : ''));
+  else if (ev.stage === 'reading_pdf') setProgress(4, STAGE_LABEL.reading_pdf + (ev.message ? (' · ' + ev.message) : ''));
+  else if (ev.stage === 'assembling') setProgress(95, STAGE_LABEL.assembling);
+  else if (ev.stage === 'validating') setProgress(98, STAGE_LABEL.validating);
+  else if (STAGE_LABEL[ev.stage]) setProgress(null, STAGE_LABEL[ev.stage]);
+}
+
+// Stream the extraction as Server-Sent Events, advancing the progress bar from
+// each event. Falls back to the blocking /extract JSON route if the browser
+// can't read the streaming body. Throws {data:{error}} on failure.
+async function streamExtract(fd){
+  const res = await fetch('/extract/stream', { method: 'POST', body: fd });
+  if (!res.ok) { const d = await res.json().catch(() => ({})); throw { data: d }; }
+  const ctype = res.headers.get('content-type') || '';
+  if (!res.body || ctype.indexOf('text/event-stream') < 0) {
+    const r2 = await fetch('/extract', { method: 'POST', body: fd });
+    const d2 = await r2.json(); if (!r2.ok) throw { data: d2 }; return d2;
+  }
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = '', result = null, errMsg = null;
+  for (;;) {
+    const chunk = await reader.read(); if (chunk.done) break;
+    buf += dec.decode(chunk.value, { stream: true });
+    let i;
+    while ((i = buf.indexOf('\\n\\n')) >= 0) {
+      const line = buf.slice(0, i).trim(); buf = buf.slice(i + 2);
+      if (line.indexOf('data:') !== 0) continue;
+      let ev; try { ev = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+      if (ev.stage === 'done') result = ev.result;
+      else if (ev.stage === 'error') errMsg = ev.error;
+      else onProgress(ev);
+    }
+  }
+  if (errMsg) throw { data: { error: errMsg } };
+  if (!result) throw { data: { error: 'extraction ended without a result' } };
+  return result;
+}
+
 f.onsubmit = async (e) => {
   e.preventDefault();
-  go.disabled = true; go.textContent = 'Extracting… (this can take a few minutes)';
-  out.style.display = 'block'; out.textContent = 'Reading PDF and calling the model…';
+  go.disabled = true; go.textContent = 'Extracting…'; f.setAttribute('aria-busy', 'true');
+  out.style.display = 'none'; out.innerHTML = '';
+  setProgress(2, 'Starting…');
   try {
-    const res = await fetch('/extract', { method: 'POST', body: new FormData(f) });
-    const data = await res.json();
-    if (!res.ok) { out.innerHTML = '<span class="err">Error: ' + esc(data.error||'unknown') + '</span>\\n\\n' + esc(data.detail||''); }
-    else {
-      let html = '<span class="' + (data.problems.length ? 'warn' : 'ok') + '">' + esc(data.summary) + '</span>';
-      if (data.problems.length) html += '\\n\\nNotes:\\n - ' + data.problems.map(esc).join('\\n - ');
-      lastBlob = new Blob([JSON.stringify(data.filing, null, 2)], {type:'application/json'});
-      lastName = data.filename; lastFiling = data.filing;
-      lastSymbol = (data.filing && data.filing.metadata && data.filing.metadata.symbol) || '';
-      lastAnalysis = data.analysis || null;
-      html += '\\n\\n<div class="outputs"><span class="olabel">Outputs — pick what you need:</span>';
-      html += '<a class="dl" id="dl" href="#">⬇ qscreen JSON</a>';
-      html += '<a class="dl" id="xlsx" href="#">⬇ Excel transcript</a>';
-      html += '<a class="dl" id="csv" href="#">⬇ CSV</a>';
-      html += '<a class="dl" id="stmt" href="#">📄 Statements (HTML)</a>';
-      html += '<a class="dl" id="rep" href="#">📰 Analyst report</a>';
-      if (UPLOAD_ENABLED && !data.problems.length)
-        html += '<a class="dl up" id="up" href="#">⬆ Upload to qscreen.app</a>'
-             + '<label class="inc"><input type="checkbox" id="incan"> include analysis in upload</label>';
-      html += '</div>';
-      html += renderSegments((data.analysis||{}).segments);
-      html += renderAnalysis(data.analysis);
-      html += renderDcfPanel();
-      out.innerHTML = html;
-      document.getElementById('dl').onclick = (ev) => {
-        ev.preventDefault();
-        const url = URL.createObjectURL(lastBlob);
-        const a = document.createElement('a'); a.href = url; a.download = lastName; a.click();
-        URL.revokeObjectURL(url);
-      };
-      async function dlPost(path, fname){
-        const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
-                                     body: JSON.stringify({ filing: lastFiling })});
-        if(!r.ok){ const d = await r.json().catch(()=>({})); throw new Error(d.error || ('HTTP '+r.status)); }
-        const url = URL.createObjectURL(await r.blob());
-        const a = document.createElement('a'); a.href = url; a.download = fname; a.click(); URL.revokeObjectURL(url);
-      }
-      const xl = document.getElementById('xlsx');
-      if (xl) xl.onclick = async (ev) => { ev.preventDefault(); const t = xl.textContent; xl.textContent = '⬇ Building…';
-        try { await dlPost('/workbook', (lastSymbol||'filing') + '_transcript.xlsx'); xl.textContent = t; }
-        catch(e){ xl.textContent = '⬇ Excel failed'; } };
-      const cv = document.getElementById('csv');
-      if (cv) cv.onclick = async (ev) => { ev.preventDefault();
-        try { await dlPost('/export.csv', (lastSymbol||'filing') + '_line_items.csv'); }
-        catch(e){ cv.textContent = '⬇ CSV failed'; } };
-      const dg = document.getElementById('dcfgo');
-      if (dg) dg.onclick = (ev) => { ev.preventDefault(); runDcf(); };
-      const st = document.getElementById('stmt');
-      if (st) st.onclick = async (ev) => {
-        ev.preventDefault(); const label = st.textContent; st.textContent = '📄 Building…';
-        try {
-          const r = await fetch('/statements', { method: 'POST', headers: {'Content-Type':'application/json'},
-                                                 body: JSON.stringify({ filing: lastFiling }) });
-          const d = await r.json(); if (!r.ok) throw new Error(d.error || 'failed');
-          const url = URL.createObjectURL(new Blob([d.html], {type:'text/html'}));
-          const a = document.createElement('a'); a.href = url; a.download = (lastSymbol||'filing') + '_statements.html'; a.click();
-          URL.revokeObjectURL(url); st.textContent = label;
-        } catch (e) { st.textContent = '📄 Statements failed'; }
-      };
-      const rp = document.getElementById('rep');
-      if (rp) rp.onclick = async (ev) => {
-        ev.preventDefault(); const label = rp.textContent; rp.textContent = '📰 Building…';
-        try {
-          const r = await fetch('/report', { method: 'POST', headers: {'Content-Type':'application/json'},
-                                             body: JSON.stringify({ filing: lastFiling, symbol: lastSymbol }) });
-          const d = await r.json(); if (!r.ok) throw new Error(d.error || 'failed');
-          const url = URL.createObjectURL(new Blob([d.html], {type:'text/html'}));
-          const a = document.createElement('a'); a.href = url; a.download = (lastSymbol||'report') + '_report.html'; a.click();
-          URL.revokeObjectURL(url); rp.textContent = label;
-        } catch (e) { rp.textContent = '📰 Report failed'; }
-      };
-      const up = document.getElementById('up');
-      if (up) up.onclick = async (ev) => {
-        ev.preventDefault();
-        up.classList.add('busy'); up.textContent = '⬆ Uploading…';
-        const note = document.createElement('div');
-        try {
-          const inc = document.getElementById('incan');
-          const r = await fetch('/upload', { method: 'POST', headers: {'Content-Type':'application/json'},
-                                             body: JSON.stringify({ filing: lastFiling,
-                                               with_analysis: !!(inc && inc.checked), analysis: lastAnalysis }) });
-          const d = await r.json();
-          if (r.ok) { up.textContent = '✅ Uploaded to qscreen.app'; }
-          else {
-            up.classList.remove('busy'); up.textContent = '⬆ Retry upload';
-            note.className = 'err';
-            note.textContent = 'Upload failed: ' + (d.error || 'unknown') +
-              (d.problems ? '\\n - ' + d.problems.join('\\n - ') : '');
-            out.appendChild(note);
-          }
-        } catch (err) {
-          up.classList.remove('busy'); up.textContent = '⬆ Retry upload';
-          note.className = 'err'; note.textContent = 'Upload failed: ' + err; out.appendChild(note);
-        }
-      };
-    }
-  } catch (err) { out.innerHTML = '<span class="err">Request failed: ' + esc(err) + '</span>'; }
-  go.disabled = false; go.textContent = 'Extract';
+    renderResult(await streamExtract(new FormData(f)));
+  } catch (err) {
+    const data = (err && err.data) || { error: String((err && err.message) || err) };
+    out.style.display = 'block';
+    out.innerHTML = '<div class="banner err"><span class="ic" aria-hidden="true">✕</span>'
+      + '<div><div>Extraction failed</div><div class="notes">' + esc(data.error || 'unknown') + '</div></div></div>';
+  } finally {
+    clearProgress(); go.disabled = false; go.textContent = 'Extract'; f.removeAttribute('aria-busy');
+  }
 };
+
+function renderResult(data){
+  out.style.display = 'block';
+  const clean = !data.problems.length;
+  let html = '<div class="banner ' + (clean ? 'ok' : 'warn') + '"><span class="ic" aria-hidden="true">'
+    + (clean ? '✓' : '⚠') + '</span><div><div>' + esc(data.summary) + '</div>';
+  if (data.problems.length)
+    html += '<ul class="notes">' + data.problems.map(esc).map(p => '<li>' + p + '</li>').join('') + '</ul>';
+  html += '</div></div>';
+  lastBlob = new Blob([JSON.stringify(data.filing, null, 2)], { type: 'application/json' });
+  lastName = data.filename; lastFiling = data.filing;
+  lastSymbol = (data.filing && data.filing.metadata && data.filing.metadata.symbol) || '';
+  lastAnalysis = data.analysis || null;
+  html += '<div class="outputs"><span class="olabel">Outputs — pick what you need:</span>';
+  html += '<a class="dl" id="dl" href="#">⬇ qscreen JSON</a>';
+  html += '<a class="dl" id="xlsx" href="#">⬇ Excel transcript</a>';
+  html += '<a class="dl" id="csv" href="#">⬇ CSV</a>';
+  html += '<a class="dl" id="stmt" href="#">📄 Statements (HTML)</a>';
+  html += '<a class="dl" id="rep" href="#">📰 Analyst report</a>';
+  if (UPLOAD_ENABLED && clean)
+    html += '<a class="dl up" id="up" href="#">⬆ Upload to qscreen.app</a>'
+         + '<label class="inc"><input type="checkbox" id="incan"> include analysis in upload</label>';
+  html += '</div>';
+  html += renderSegments((data.analysis || {}).segments);
+  html += renderAnalysis(data.analysis);
+  html += renderDcfPanel();
+  out.innerHTML = html;
+  rememberFiling(lastName, lastFiling, lastAnalysis);
+  wireOutputs();
+}
+
+function wireOutputs(){
+  document.getElementById('dl').onclick = (ev) => {
+    ev.preventDefault();
+    const url = URL.createObjectURL(lastBlob);
+    const a = document.createElement('a'); a.href = url; a.download = lastName; a.click();
+    URL.revokeObjectURL(url);
+  };
+  async function dlPost(path, fname){
+    const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+                                 body: JSON.stringify({ filing: lastFiling })});
+    if(!r.ok){ const d = await r.json().catch(()=>({})); throw new Error(d.error || ('HTTP '+r.status)); }
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement('a'); a.href = url; a.download = fname; a.click(); URL.revokeObjectURL(url);
+  }
+  const xl = document.getElementById('xlsx');
+  if (xl) xl.onclick = async (ev) => { ev.preventDefault(); const t = xl.textContent; xl.textContent = '⬇ Building…';
+    try { await dlPost('/workbook', (lastSymbol||'filing') + '_transcript.xlsx'); xl.textContent = t; }
+    catch(e){ xl.textContent = '⬇ Excel failed'; } };
+  const cv = document.getElementById('csv');
+  if (cv) cv.onclick = async (ev) => { ev.preventDefault();
+    try { await dlPost('/export.csv', (lastSymbol||'filing') + '_line_items.csv'); }
+    catch(e){ cv.textContent = '⬇ CSV failed'; } };
+  const dg = document.getElementById('dcfgo');
+  if (dg) dg.onclick = (ev) => { ev.preventDefault(); runDcf(); };
+  const st = document.getElementById('stmt');
+  if (st) st.onclick = async (ev) => {
+    ev.preventDefault(); const label = st.textContent; st.textContent = '📄 Building…';
+    try {
+      const r = await fetch('/statements', { method: 'POST', headers: {'Content-Type':'application/json'},
+                                             body: JSON.stringify({ filing: lastFiling }) });
+      const d = await r.json(); if (!r.ok) throw new Error(d.error || 'failed');
+      const url = URL.createObjectURL(new Blob([d.html], {type:'text/html'}));
+      const a = document.createElement('a'); a.href = url; a.download = (lastSymbol||'filing') + '_statements.html'; a.click();
+      URL.revokeObjectURL(url); st.textContent = label;
+    } catch (e) { st.textContent = '📄 Statements failed'; }
+  };
+  const rp = document.getElementById('rep');
+  if (rp) rp.onclick = async (ev) => {
+    ev.preventDefault(); const label = rp.textContent; rp.textContent = '📰 Building…';
+    try {
+      const r = await fetch('/report', { method: 'POST', headers: {'Content-Type':'application/json'},
+                                         body: JSON.stringify({ filing: lastFiling, symbol: lastSymbol }) });
+      const d = await r.json(); if (!r.ok) throw new Error(d.error || 'failed');
+      const url = URL.createObjectURL(new Blob([d.html], {type:'text/html'}));
+      const a = document.createElement('a'); a.href = url; a.download = (lastSymbol||'report') + '_report.html'; a.click();
+      URL.revokeObjectURL(url); rp.textContent = label;
+    } catch (e) { rp.textContent = '📰 Report failed'; }
+  };
+  const up = document.getElementById('up');
+  if (up) up.onclick = async (ev) => {
+    ev.preventDefault();
+    up.classList.add('busy'); up.textContent = '⬆ Uploading…';
+    const note = document.createElement('div');
+    try {
+      const inc = document.getElementById('incan');
+      const r = await fetch('/upload', { method: 'POST', headers: {'Content-Type':'application/json'},
+                                         body: JSON.stringify({ filing: lastFiling,
+                                           with_analysis: !!(inc && inc.checked), analysis: lastAnalysis }) });
+      const d = await r.json();
+      if (r.ok) { up.textContent = '✅ Uploaded to qscreen.app'; }
+      else {
+        up.classList.remove('busy'); up.textContent = '⬆ Retry upload';
+        note.className = 'err';
+        note.textContent = 'Upload failed: ' + (d.error || 'unknown') +
+          (d.problems ? '\\n - ' + d.problems.join('\\n - ') : '');
+        out.appendChild(note);
+      }
+    } catch (err) {
+      up.classList.remove('busy'); up.textContent = '⬆ Retry upload';
+      note.className = 'err'; note.textContent = 'Upload failed: ' + err; out.appendChild(note);
+    }
+  };
+}
 const cmpBtn = document.getElementById('cmpgo');
 if (cmpBtn) cmpBtn.onclick = runCompare;
 const dashBtn = document.getElementById('dashgo');
@@ -549,6 +685,7 @@ def index():
                             "local": bool(cfg.get("local")), "setup": cfg.get("setup", "")}
                      for name, cfg in engine.PROVIDERS.items()}
     html = (PAGE
+            .replace("__UI_CSS__", qscreen_ui.css())
             .replace("__SUBSECTOR_OPTIONS__", _subsector_options_html())
             .replace("__SYMBOL_MAP_JSON__", json.dumps(SYMBOL_SUBSECTOR))
             .replace("__PROVIDER_INFO_JSON__", json.dumps(provider_info))
@@ -556,97 +693,134 @@ def index():
     return Response(html, mimetype="text/html")
 
 
+class _BadRequest(Exception):
+    """A 400-level input problem with a user-safe message (no internals)."""
+
+
+def _parse_extract_request(req):
+    """Validate the multipart form, build the CLI-equivalent args, resolve the
+    provider/mode/profile, and save the upload to a private temp file.
+
+    Runs inside the Flask request context (it touches ``request``). Raises
+    ``_BadRequest`` for user errors and lets ``SystemExit`` (provider/key/model
+    config errors) propagate — both map to a 400 at the route. Returns a plain
+    dict so the heavy lifting in ``_run_extract`` can run on a worker thread.
+    """
+    up = req.files.get("pdf")
+    if not up:
+        raise _BadRequest("no PDF uploaded")
+    symbol = (req.form.get("symbol") or "").strip().upper()
+    subsector = (req.form.get("subsector") or "").strip()
+    year = req.form.get("year")
+    period = (req.form.get("period") or "FY").strip()
+    if not (symbol and subsector and year):
+        raise _BadRequest("symbol, sub-sector and year are required")
+    try:
+        year = int(year)
+    except (TypeError, ValueError):
+        raise _BadRequest("year must be an integer")
+    # The rich QSE sub-sector is stored; the extraction category (1 of 5)
+    # drives how the LLM reads the statements.
+    sector = SUBSECTOR_TO_EXTRACTION.get(subsector, "other")
+    provider = (req.form.get("provider") or "").strip() or None  # None → auto-detect
+    model = (req.form.get("model") or "").strip() or None
+    mode = (req.form.get("mode") or "auto").strip()   # auto | basic | pro
+    no_llm = bool(req.form.get("no_llm"))             # fully-offline checkbox
+
+    # Build the same args object the CLI uses; resolve_provider picks the
+    # base URL / model / key (from the matching env var) and validates them.
+    args = SimpleNamespace(
+        symbol=symbol, sector=sector, year=int(year), period=period,
+        provider=provider, base_url=None, model=model,
+        max_tokens=16384, timeout=600, retries=4,
+        pages_per_chunk=12, overlap=1, no_chunk=False,
+        no_json_mode=False, llm_key=None,
+        mode=mode, basic=False, pro=False, no_llm=no_llm,
+        guided=False, no_guided=False, guided_notes=False,
+    )
+    engine.apply_mode(args)               # --mode/--no-llm → guided flags
+    # Fully-offline (--no-llm) needs no provider at all; otherwise resolve it.
+    try:
+        cfg = engine.resolve_provider(args)   # raises SystemExit if no provider/key
+    except SystemExit:
+        if no_llm:
+            cfg = engine.deterministic_cfg()
+        else:
+            raise
+    args.guided = engine.resolve_guided(args, cfg)   # Basic vs Pro
+    if no_llm:
+        args.guided = True
+    if args.guided:
+        args.pages_per_chunk = engine.GUIDED_DEFAULT_PAGES
+    args._profile = qatar.profile_for_year(symbol, int(year))  # company+year-aware prompting
+
+    # Save the upload to a private temp file (not a predictable CWD path).
+    fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="qscreen_upload_")
+    os.close(fd)
+    up.save(tmp_path)
+    return {"args": args, "cfg": cfg, "tmp_path": tmp_path,
+            "symbol": symbol, "sector": sector, "subsector": subsector,
+            "year": int(year), "period": period,
+            "source_filename": Path(up.filename or "").name}
+
+
+def _run_extract(parsed, progress_cb=None):
+    """Run the engine on an already-parsed request and shape the JSON result.
+
+    Pure compute — no Flask request context needed — so the streaming route can
+    call it on a background thread, passing ``progress_cb`` to receive the
+    engine's per-window events. ``progress_cb=None`` reproduces the blocking path.
+    """
+    args, cfg = parsed["args"], parsed["cfg"]
+    symbol, year, period = parsed["symbol"], parsed["year"], parsed["period"]
+    try:
+        pages, sha = engine.pdf_to_pages(parsed["tmp_path"], progress_cb=progress_cb)
+    finally:
+        Path(parsed["tmp_path"]).unlink(missing_ok=True)
+
+    filing = engine.extract_filing(pages, args, progress_cb)
+    filing.setdefault("metadata", {}).update({
+        "symbol": symbol, "sector": parsed["sector"], "sub_sector": parsed["subsector"],
+        "fiscal_year": int(year),
+        "fiscal_period": period, "source_file": parsed["source_filename"], "source_sha256": sha,
+        "extracted_at": engine.datetime.now(engine.timezone.utc).isoformat(),
+        "extractor": {"provider": cfg["name"], "model": cfg["model"]},
+    })
+    engine._emit(progress_cb, stage="validating", message="checking the filing contract")
+    problems = engine.validate_filing(filing)
+    try:                                       # analysis must never sink a good extraction
+        analysis = qscreen_analyze.analyze(symbol, [filing], args._profile)
+    except Exception as ex:
+        analysis = {"warnings": [f"analysis failed: {ex}"], "ratios": {}, "trends": {},
+                    "red_flags": [], "segments": {"dimensions": {}, "warnings": []}}
+    nseg = len(filing.get("segments", []))
+    nflags = len(analysis.get("red_flags", []))
+    summary = (f"Extracted {len(filing.get('statements', []))} statements, "
+               f"{nseg} segments, {len(filing.get('notes', []))} notes, "
+               f"audit={filing.get('audit', {}).get('opinion_type')}, {nflags} red flag(s).")
+    if problems:
+        summary += f" ({len(problems)} note(s) below — review before uploading.)"
+    else:
+        summary += " Clean — ready to upload to qscreen.app."
+
+    return {
+        "summary": summary,
+        "problems": problems,
+        "filing": filing,
+        "analysis": analysis,
+        "filename": f"{symbol}_{year}_{period}_filing.json",
+    }
+
+
 @app.route("/extract", methods=["POST"])
 def extract():
+    """Blocking extract → JSON. The no-JS fallback; identical payload to the
+    terminal 'done' event of /extract/stream."""
     try:
-        up = request.files.get("pdf")
-        if not up:
-            return {"error": "no PDF uploaded"}, 400
-        symbol = (request.form.get("symbol") or "").strip().upper()
-        subsector = (request.form.get("subsector") or "").strip()
-        year = request.form.get("year")
-        period = (request.form.get("period") or "FY").strip()
-        if not (symbol and subsector and year):
-            return {"error": "symbol, sub-sector and year are required"}, 400
-        try:
-            year = int(year)
-        except (TypeError, ValueError):
-            return {"error": "year must be an integer"}, 400
-        # The rich QSE sub-sector is stored; the extraction category (1 of 5)
-        # drives how the LLM reads the statements.
-        sector = SUBSECTOR_TO_EXTRACTION.get(subsector, "other")
-        provider = (request.form.get("provider") or "").strip() or None  # None → auto-detect
-        model = (request.form.get("model") or "").strip() or None
-        mode = (request.form.get("mode") or "auto").strip()   # auto | basic | pro
-        no_llm = bool(request.form.get("no_llm"))             # fully-offline checkbox
-
-        # Build the same args object the CLI uses; resolve_provider picks the
-        # base URL / model / key (from the matching env var) and validates them.
-        args = SimpleNamespace(
-            symbol=symbol, sector=sector, year=int(year), period=period,
-            provider=provider, base_url=None, model=model,
-            max_tokens=16384, timeout=600, retries=4,
-            pages_per_chunk=12, overlap=1, no_chunk=False,
-            no_json_mode=False, llm_key=None,
-            mode=mode, basic=False, pro=False, no_llm=no_llm,
-            guided=False, no_guided=False, guided_notes=False,
-        )
-        engine.apply_mode(args)               # --mode/--no-llm → guided flags
-        # Fully-offline (--no-llm) needs no provider at all; otherwise resolve it.
-        try:
-            cfg = engine.resolve_provider(args)   # raises SystemExit (caught below) if no provider/key
-        except SystemExit:
-            if no_llm:
-                cfg = engine.deterministic_cfg()
-            else:
-                raise
-        args.guided = engine.resolve_guided(args, cfg)   # Basic vs Pro
-        if no_llm:
-            args.guided = True
-        if args.guided:
-            args.pages_per_chunk = engine.GUIDED_DEFAULT_PAGES
-        args._profile = qatar.profile_for_year(symbol, int(year))  # company+year-aware prompting
-
-        # Save the upload to a private temp file (not a predictable CWD path).
-        fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="qscreen_upload_")
-        os.close(fd)
-        up.save(tmp_path)
-        try:
-            pages, sha = engine.pdf_to_pages(tmp_path)
-        finally:
-            Path(tmp_path).unlink(missing_ok=True)
-
-        filing = engine.extract_filing(pages, args)
-        filing.setdefault("metadata", {}).update({
-            "symbol": symbol, "sector": sector, "sub_sector": subsector,
-            "fiscal_year": int(year),
-            "fiscal_period": period, "source_file": Path(up.filename or "").name, "source_sha256": sha,
-            "extracted_at": engine.datetime.now(engine.timezone.utc).isoformat(),
-            "extractor": {"provider": cfg["name"], "model": cfg["model"]},
-        })
-        problems = engine.validate_filing(filing)
-        try:                                       # analysis must never sink a good extraction
-            analysis = qscreen_analyze.analyze(symbol, [filing], args._profile)
-        except Exception as ex:
-            analysis = {"warnings": [f"analysis failed: {ex}"], "ratios": {}, "trends": {},
-                        "red_flags": [], "segments": {"dimensions": {}, "warnings": []}}
-        nseg = len(filing.get("segments", []))
-        nflags = len(analysis.get("red_flags", []))
-        summary = (f"Extracted {len(filing.get('statements', []))} statements, "
-                   f"{nseg} segments, {len(filing.get('notes', []))} notes, "
-                   f"audit={filing.get('audit', {}).get('opinion_type')}, {nflags} red flag(s).")
-        if problems:
-            summary += f" ({len(problems)} note(s) below — review before uploading.)"
-        else:
-            summary += " Clean — ready to upload to qscreen.app."
-
-        return {
-            "summary": summary,
-            "problems": problems,
-            "filing": filing,
-            "analysis": analysis,
-            "filename": f"{symbol}_{year}_{period}_filing.json",
-        }
+        parsed = _parse_extract_request(request)
+        return _run_extract(parsed)
+    except _BadRequest as e:
+        return {"error": str(e)}, 400
     except SystemExit as e:                       # provider/key/model config errors
         return {"error": str(e)}, 400
     except Exception as e:
@@ -654,6 +828,50 @@ def extract():
         # library internals, and any input echoed in the message).
         traceback.print_exc()
         return {"error": f"{type(e).__name__}: {e}"}, 500
+
+
+@app.route("/extract/stream", methods=["POST"])
+def extract_stream():
+    """Same extract, streamed as Server-Sent Events so the browser can show a
+    live progress bar. Parse + save the upload here (request context is live),
+    then run the engine on a worker thread that feeds a thread-safe queue; the
+    generator relays each event and a terminal 'done' (carrying the same payload
+    /extract returns) or 'error' event."""
+    try:
+        parsed = _parse_extract_request(request)
+    except _BadRequest as e:
+        return {"error": str(e)}, 400
+    except SystemExit as e:
+        return {"error": str(e)}, 400
+    except Exception as e:
+        traceback.print_exc()
+        return {"error": f"{type(e).__name__}: {e}"}, 500
+
+    q: queue.Queue = queue.Queue()
+
+    def worker():
+        try:
+            result = _run_extract(parsed, progress_cb=q.put)
+            q.put({"stage": "done", "result": result})
+        except SystemExit as e:
+            q.put({"stage": "error", "error": str(e)})
+        except Exception as e:
+            traceback.print_exc()                 # server-side only
+            q.put({"stage": "error", "error": f"{type(e).__name__}: {e}"})
+        finally:
+            q.put(None)                           # sentinel: stream complete
+
+    def gen():
+        threading.Thread(target=worker, daemon=True).start()
+        while True:
+            ev = q.get()
+            if ev is None:
+                break
+            yield f"data: {json.dumps(ev)}\n\n"
+
+    return Response(stream_with_context(gen()), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                             "Connection": "keep-alive"})
 
 
 @app.route("/workbook", methods=["POST"])
