@@ -5,6 +5,66 @@ Two modes: **local browser app** (drag-and-drop) or **one-command CLI**.
 
 > **First run?** Follow **[RUNBOOK.md](RUNBOOK.md)** — install → key → one command → every output.
 
+## Run it
+
+### New to this? Step-by-step (no coding experience needed)
+
+It runs on your own computer. Steps 1–4 are one-time.
+
+1. **Install Python** (free) from **[python.org/downloads](https://www.python.org/downloads/)** and run the installer.
+   On **Windows**, tick **“Add Python to PATH”** on the first screen.
+2. **Download the tool.** At the top of this page click the green **`<> Code`** button → **Download ZIP**, then unzip it. Note the folder it makes.
+3. **Open a terminal in that folder:**
+   - **Mac:** right-click the folder → **New Terminal at Folder**.
+   - **Windows:** open the folder, click the address bar, type **`cmd`**, and press **Enter**.
+4. **Install the pieces it needs** — paste one line and press Enter:
+   - **Mac / Linux:** `python3 -m pip install flask pdfplumber requests`
+   - **Windows:** `python -m pip install flask pdfplumber requests`
+5. **Start the app:**
+   - **Mac / Linux:** `python3 qscreen_app.py`
+   - **Windows:** `python qscreen_app.py`
+6. **Use it.** Open your web browser to **http://127.0.0.1:8765**. In the **⚙️ Settings** panel, pick a provider, click its **Get a key** link to sign up, copy the key, paste it, and **Save** (just once). Then drag a PDF onto the page and click **Extract** — the symbol’s sub-sector and the **fiscal year fill in by themselves**. When it finishes, click **⬇ Download**.
+
+To stop the app, switch to the terminal and press **Ctrl + C**. To run it again later, just repeat steps 5–6.
+
+<details><summary><b>Something not working?</b></summary>
+
+- **`python3` / `python` “command not found”** — Python isn’t on your PATH. On Windows, reinstall and tick **“Add Python to PATH”**; on Mac, try the other word (`python` instead of `python3`).
+- **`pip` says “externally-managed-environment”** — make a private environment first, then redo step 4 in the same terminal:
+  `python3 -m venv .venv && source .venv/bin/activate` *(Windows: `python -m venv .venv && .venv\Scripts\activate`)*.
+- **The page won’t load** — keep the step-5 terminal window open (closing it stops the app), and use exactly `http://127.0.0.1:8765`.
+- **No API key, or don’t want to pay?** In the *Advanced* panel pick a **local** model (e.g. Ollama) to run with no key — see the offline-models section below.
+</details>
+
+### Comfortable with a terminal?
+
+**Browser app:**
+
+```bash
+pip install flask pdfplumber requests      # one-time
+python3 qscreen_app.py                      # then open http://127.0.0.1:8765
+```
+
+Save your API key once in the **⚙️ Settings** panel, then drag in a PDF and click **Extract** —
+the fiscal year & period are read from the filing automatically. No key? Pick a **local** model
+under *Advanced* and run fully offline.
+
+**CLI (one command per PDF):**
+
+```bash
+python3 qscreen_ingest.py report.pdf \
+  --symbol QIBK --sector islamic_bank --year 2024 --period FY
+```
+
+Have `git`? One line clones, installs deps, and self-tests:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/0xBingBong69/qscreen-filing-tool/main/install.sh | bash
+```
+
+More detail below — [Install](#install) (incl. the packaged `qscreen-app` /
+`qscreen-ingest` commands) and [Configure](#configure-once) for API keys.
+
 ## Install
 
 **Option 1 — installer script** (clones to `~/.qscreen-filing-tool`, installs deps, self-tests):
@@ -139,8 +199,11 @@ output is the **same lossless filing contract** as Pro.
 python3 qscreen_app.py            # or: qscreen-app
 ```
 
-Open **http://127.0.0.1:8765**, drag in a PDF, fill Symbol / Sector / Year /
-Period (type a known symbol and the sub-sector auto-fills), click **Extract**.
+Open **http://127.0.0.1:8765**, drag in a PDF, type the Symbol (a known symbol
+auto-fills its sub-sector), click **Extract** — the **fiscal year & period are
+read from the filing automatically** (a single box appears to type the year only
+if it can't be read). Save your provider's API key once in the **⚙️ Settings**
+panel and it's used right away — no editing `.env`, no restart.
 When it finishes, click **Download** to get the `SYMBOL_YEAR_PERIOD_filing.json`.
 Nothing is auto-uploaded — you stay in control. An **Upload to qscreen.app**
 button appears only when the server has `INGEST_TOKEN` set, and only uploads
