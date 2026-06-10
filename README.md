@@ -5,6 +5,31 @@ Two modes: **local browser app** (drag-and-drop) or **one-command CLI**.
 
 > **First run?** Follow **[RUNBOOK.md](RUNBOOK.md)** — install → key → one command → every output.
 
+## Run it
+
+**Option A — browser app (easiest):**
+
+```bash
+pip install flask pdfplumber requests      # one-time
+python3 qscreen_app.py                      # then open http://127.0.0.1:8765
+```
+
+In the page: save your API key once in the **⚙️ Settings** panel (no terminal, no
+restart), then drag in a PDF and click **Extract**. Type a known symbol and its
+sub-sector auto-fills; the **fiscal year & period are read from the filing**, so
+there's nothing else to fill in. No API key? Pick a **local** model under
+*Advanced* and run fully offline.
+
+**Option B — CLI (one command per PDF):**
+
+```bash
+python3 qscreen_ingest.py report.pdf \
+  --symbol QIBK --sector islamic_bank --year 2024 --period FY
+```
+
+More detail below — [Install](#install) (incl. the packaged `qscreen-app` /
+`qscreen-ingest` commands) and [Configure](#configure-once) for API keys.
+
 ## Install
 
 **Option 1 — installer script** (clones to `~/.qscreen-filing-tool`, installs deps, self-tests):
@@ -139,8 +164,11 @@ output is the **same lossless filing contract** as Pro.
 python3 qscreen_app.py            # or: qscreen-app
 ```
 
-Open **http://127.0.0.1:8765**, drag in a PDF, fill Symbol / Sector / Year /
-Period (type a known symbol and the sub-sector auto-fills), click **Extract**.
+Open **http://127.0.0.1:8765**, drag in a PDF, type the Symbol (a known symbol
+auto-fills its sub-sector), click **Extract** — the **fiscal year & period are
+read from the filing automatically** (a single box appears to type the year only
+if it can't be read). Save your provider's API key once in the **⚙️ Settings**
+panel and it's used right away — no editing `.env`, no restart.
 When it finishes, click **Download** to get the `SYMBOL_YEAR_PERIOD_filing.json`.
 Nothing is auto-uploaded — you stay in control. An **Upload to qscreen.app**
 button appears only when the server has `INGEST_TOKEN` set, and only uploads
