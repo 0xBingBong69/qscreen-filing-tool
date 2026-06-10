@@ -2,8 +2,10 @@
 """
 qscreen_app.py — local browser app for the QSE filing ingestor.
 
-Run it on your laptop, open the page, drag in a PDF, fill four fields, click
-Extract. It runs the SAME engine as qscreen_ingest.py (imported, not
+Run it on your laptop, open the page, drag in a PDF, pick the symbol, click
+Extract — the fiscal year is read from the filing automatically. Save an API
+key once in the Settings panel (no terminal, no restart). It runs the SAME
+engine as qscreen_ingest.py (imported, not
 re-implemented) and gives you a downloadable JSON report to upload to
 qscreen.app. Nothing is auto-uploaded — you stay in control.
 
@@ -118,9 +120,10 @@ PAGE = """<!doctype html>
   label.inc { font-size: 12px; color: #555; margin-left: 10px; } label.inc input { vertical-align: middle; }
   .outputs { margin: 14px 0 4px; padding-top: 10px; border-top: 1px solid #eee; }
   .olabel { display: block; font-weight: 600; color: #555; font-size: 13px; margin-bottom: 6px; }
+  details.settings #setout { margin-top: 10px; font-size: 14px; white-space: pre-wrap; }
 </style></head><body>
 <h1>QScreen Filing Ingestor</h1>
-<p class="sub">Drop a QSE financial-report PDF, fill the fields, click Extract. Then download the report and upload it to qscreen.app. Type a known symbol and the sub-sector auto-fills.</p>
+<p class="sub">Drop a QSE financial-report PDF, pick the symbol &amp; sub-sector, click Extract — the fiscal year is read from the filing automatically. Then download the report and upload it to qscreen.app. Type a known symbol and the sub-sector auto-fills.</p>
 <form id="f">
   <label>Filing PDF</label>
   <input type="file" name="pdf" accept="application/pdf" required>
@@ -133,8 +136,9 @@ PAGE = """<!doctype html>
     </div>
   </div>
   <p class="hint" id="hint"></p>
-  <div class="row">
-    <div><label>Year</label><input name="year" type="number" placeholder="2024" required></div>
+  <div class="row" id="yearfallback" style="display:none">
+    <div><label>Fiscal year <span class="muted">(couldn't read it automatically — type it)</span></label>
+      <input name="year" type="number" placeholder="2024"></div>
     <div><label>Period</label>
       <select name="period">
         <option>FY</option><option>Q1</option><option>Q2</option><option>Q3</option>
@@ -186,6 +190,23 @@ PAGE = """<!doctype html>
 </form>
 <div id="out"></div>
 
+<details class="cmp settings"><summary>⚙️ Settings — save an API key (no terminal, no restart)</summary>
+  <p class="muted">Paste a cloud provider's API key once. It's saved to the <code>.env</code>
+  next to the app and used right away — no file editing, no restart. Local models need no key.</p>
+  <p class="keyhint" id="setstatus"></p>
+  <div class="row">
+    <div><label>Provider</label><select id="set_provider"></select></div>
+    <div><label>API key</label><input id="set_key" type="password" placeholder="paste key here" autocomplete="off"></div>
+  </div>
+  <p class="keyhint" id="set_getkey"></p>
+  <div class="row">
+    <div><label>Model <span class="muted">(blank = provider default)</span></label>
+      <input id="set_model" placeholder="default" autocomplete="off"></div>
+  </div>
+  <button id="setsave" type="button">Save key</button>
+  <div id="setout"></div>
+</details>
+
 <details class="cmp"><summary>Compare / screen extracted filings</summary>
   <p class="muted">Select already-extracted <code>*_filing.json</code> files.
   <b>Compare</b> ranks them as peers (on the first file's company type);
@@ -203,6 +224,7 @@ PAGE = """<!doctype html>
 const SYMBOL_SUBSECTOR = __SYMBOL_MAP_JSON__;
 const UPLOAD_ENABLED = __UPLOAD_ENABLED__;
 const PROVIDER_INFO = __PROVIDER_INFO_JSON__;
+const DETECTED_PROVIDER = __DETECTED_PROVIDER_JSON__;
 const f = document.getElementById('f'), out = document.getElementById('out'), go = document.getElementById('go');
 const provEl = document.getElementById('provider'), modelEl = document.getElementById('model'),
       provKey = document.getElementById('provkey'), modeEl = document.getElementById('mode'),
@@ -220,10 +242,10 @@ function updateProvider() {
     modelEl.placeholder = info.model || 'default';
     provKey.innerHTML = '🔑 Need a key for <b>' + info.label + '</b>? ' +
       '<a href="' + info.url + '" target="_blank" rel="noopener">Click here to get one &#8599;</a>' +
-      ', then add <code>' + info.env + '=your-key</code> to the <code>.env</code> file next to the app and restart it.';
+      ', then paste it in <b>Settings</b> below — saved for you, no terminal or restart needed.';
   } else {
     modelEl.placeholder = 'default';
-    provKey.innerHTML = '🔑 Use a cloud key (one <code>*_API_KEY</code> in <code>.env</code>) ' +
+    provKey.innerHTML = '🔑 Save a cloud key in <b>Settings</b> below, ' +
       'or pick a <b>local</b> model above to run fully offline with no key.';
   }
   updateMode();
@@ -432,9 +454,22 @@ f.onsubmit = async (e) => {
   try {
     const res = await fetch('/extract', { method: 'POST', body: new FormData(f) });
     const data = await res.json();
-    if (!res.ok) { out.innerHTML = '<span class="err">Error: ' + esc(data.error||'unknown') + '</span>\\n\\n' + esc(data.detail||''); }
+    if (!res.ok) {
+      if (data.need_year) {                       // detection failed → reveal the one fallback box
+        const fb = document.getElementById('yearfallback');
+        if (fb) fb.style.display = 'flex';
+        const yi = f.querySelector('[name=year]'); if (yi) yi.focus();
+        out.innerHTML = '<span class="warn">' + esc(data.error||'Enter the fiscal year and extract again.') + '</span>';
+      } else {
+        out.innerHTML = '<span class="err">Error: ' + esc(data.error||'unknown') + '</span>\\n\\n' + esc(data.detail||'');
+      }
+    }
     else {
-      let html = '<span class="' + (data.problems.length ? 'warn' : 'ok') + '">' + esc(data.summary) + '</span>';
+      const md = (data.filing && data.filing.metadata) || {};
+      let html = '';
+      if (md.fiscal_year) html += '<span class="muted">📅 Fiscal year ' + esc(md.fiscal_year) +
+        ' (' + esc(md.fiscal_period||'FY') + (md.period_end ? ', ended ' + esc(md.period_end) : '') + ')</span>\\n';
+      html += '<span class="' + (data.problems.length ? 'warn' : 'ok') + '">' + esc(data.summary) + '</span>';
       if (data.problems.length) html += '\\n\\nNotes:\\n - ' + data.problems.map(esc).join('\\n - ');
       lastBlob = new Blob([JSON.stringify(data.filing, null, 2)], {type:'application/json'});
       lastName = data.filename; lastFiling = data.filing;
@@ -537,6 +572,56 @@ const wbBtn = document.getElementById('wbgo');
 if (wbBtn) wbBtn.onclick = runWorkbook;
 const ttmBtn = document.getElementById('ttmgo');
 if (ttmBtn) ttmBtn.onclick = runTtm;
+
+// ── Settings: save an API key to .env and use it right away (no restart) ──
+const CLOUD_PROVIDERS = Object.keys(PROVIDER_INFO).filter(function(k){ return !PROVIDER_INFO[k].local; });
+const setProv = document.getElementById('set_provider'), setKey = document.getElementById('set_key'),
+      setModel = document.getElementById('set_model'), setGetkey = document.getElementById('set_getkey'),
+      setStatus = document.getElementById('setstatus'), setOut = document.getElementById('setout'),
+      setSave = document.getElementById('setsave');
+function setRefreshStatus(detected){
+  const d = detected || DETECTED_PROVIDER, info = d && PROVIDER_INFO[d];
+  if (info && !info.local) setStatus.innerHTML = '✓ Using <b>' + esc(info.label) + '</b> — key saved.';
+  else if (info && info.local) setStatus.innerHTML = '💻 Using local <b>' + esc(info.label) + '</b> — no key needed.';
+  else setStatus.innerHTML = 'No API key saved yet — add one below, or pick a local model in the form above.';
+}
+function setUpdateGetkey(){
+  const info = PROVIDER_INFO[setProv.value]; if (!info) return;
+  setModel.placeholder = info.model || 'default';
+  setGetkey.innerHTML = 'Need a key? <a href="' + info.url + '" target="_blank" rel="noopener">Get one for ' + esc(info.label) + ' &#8599;</a>';
+}
+async function saveKey(){
+  if (!setKey.value.trim()){ setOut.innerHTML = '<span class="warn">Paste an API key first.</span>'; return; }
+  setSave.disabled = true; const t = setSave.textContent; setSave.textContent = 'Saving…';
+  try {
+    const r = await fetch('/settings', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ provider:setProv.value, key:setKey.value.trim(), model:setModel.value.trim() }) });
+    const d = await r.json(); if (!r.ok) throw new Error(d.error || 'failed');
+    setOut.innerHTML = '<span class="ok">Saved ✓ — ' + esc(d.label) + ' key ' + esc(d.masked_key) + ', used from now on.</span>';
+    setKey.value = '';
+    if (PROVIDER_INFO[d.provider]) PROVIDER_INFO[d.provider].has_key = true;
+    const opt = [].slice.call(setProv.options).find(function(o){ return o.value === d.provider; });
+    if (opt && opt.textContent.indexOf('✓') < 0) opt.textContent += ' ✓';
+    setRefreshStatus(d.detected);
+  } catch(e){ setOut.innerHTML = '<span class="err">' + esc(e.message||e) + '</span>'; }
+  finally { setSave.disabled = false; setSave.textContent = t; }
+}
+if (setProv){
+  for (const k of CLOUD_PROVIDERS){
+    const o = document.createElement('option');
+    o.value = k; o.textContent = PROVIDER_INFO[k].label + (PROVIDER_INFO[k].has_key ? ' ✓' : '');
+    setProv.appendChild(o);
+  }
+  if (DETECTED_PROVIDER && PROVIDER_INFO[DETECTED_PROVIDER] && !PROVIDER_INFO[DETECTED_PROVIDER].local) setProv.value = DETECTED_PROVIDER;
+  setProv.addEventListener('change', setUpdateGetkey);
+  setUpdateGetkey(); setRefreshStatus();
+}
+if (setSave) setSave.onclick = saveKey;
+// Picking a new PDF clears any stale "enter the year" fallback from a prior file.
+const pdfEl = f.querySelector('[name=pdf]');
+if (pdfEl) pdfEl.addEventListener('change', function(){
+  const fb = document.getElementById('yearfallback'); if (fb) fb.style.display = 'none';
+});
 </script>
 </body></html>"""
 
@@ -546,12 +631,14 @@ def index():
     upload_enabled = bool(os.getenv("INGEST_TOKEN"))
     provider_info = {name: {"label": cfg["label"], "model": cfg["default_model"],
                             "url": cfg["key_url"], "env": cfg["env"][0],
-                            "local": bool(cfg.get("local")), "setup": cfg.get("setup", "")}
+                            "local": bool(cfg.get("local")), "setup": cfg.get("setup", ""),
+                            "has_key": any(os.getenv(k) for k in cfg["env"])}
                      for name, cfg in engine.PROVIDERS.items()}
     html = (PAGE
             .replace("__SUBSECTOR_OPTIONS__", _subsector_options_html())
             .replace("__SYMBOL_MAP_JSON__", json.dumps(SYMBOL_SUBSECTOR))
             .replace("__PROVIDER_INFO_JSON__", json.dumps(provider_info))
+            .replace("__DETECTED_PROVIDER_JSON__", json.dumps(engine.detect_provider()))
             .replace("__UPLOAD_ENABLED__", "true" if upload_enabled else "false"))
     return Response(html, mimetype="text/html")
 
@@ -564,14 +651,18 @@ def extract():
             return {"error": "no PDF uploaded"}, 400
         symbol = (request.form.get("symbol") or "").strip().upper()
         subsector = (request.form.get("subsector") or "").strip()
-        year = request.form.get("year")
-        period = (request.form.get("period") or "FY").strip()
-        if not (symbol and subsector and year):
-            return {"error": "symbol, sub-sector and year are required"}, 400
-        try:
-            year = int(year)
-        except (TypeError, ValueError):
-            return {"error": "year must be an integer"}, 400
+        # Year/period are detected from the PDF below; a value here is the manual
+        # fallback (the form only shows those boxes when detection has failed).
+        year_in = (request.form.get("year") or "").strip()
+        period_in = (request.form.get("period") or "").strip().upper()
+        if not (symbol and subsector):
+            return {"error": "symbol and sub-sector are required"}, 400
+        year = None
+        if year_in:
+            try:
+                year = int(year_in)
+            except (TypeError, ValueError):
+                return {"error": "year must be an integer"}, 400
         # The rich QSE sub-sector is stored; the extraction category (1 of 5)
         # drives how the LLM reads the statements.
         sector = SUBSECTOR_TO_EXTRACTION.get(subsector, "other")
@@ -583,7 +674,7 @@ def extract():
         # Build the same args object the CLI uses; resolve_provider picks the
         # base URL / model / key (from the matching env var) and validates them.
         args = SimpleNamespace(
-            symbol=symbol, sector=sector, year=int(year), period=period,
+            symbol=symbol, sector=sector, year=year, period=(period_in or "FY"),
             provider=provider, base_url=None, model=model,
             max_tokens=16384, timeout=600, retries=4,
             pages_per_chunk=12, overlap=1, no_chunk=False,
@@ -605,7 +696,6 @@ def extract():
             args.guided = True
         if args.guided:
             args.pages_per_chunk = engine.GUIDED_DEFAULT_PAGES
-        args._profile = qatar.profile_for_year(symbol, int(year))  # company+year-aware prompting
 
         # Save the upload to a private temp file (not a predictable CWD path).
         fd, tmp_path = tempfile.mkstemp(suffix=".pdf", prefix="qscreen_upload_")
@@ -616,6 +706,24 @@ def extract():
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
+        # Fiscal year/period: a manual value wins (the fallback box); otherwise
+        # read them off the filing so the common case needs no input at all.
+        det_period_end = None
+        period = period_in
+        if year is None:
+            det = engine.detect_fiscal_year_period(pages)
+            year = det.get("fiscal_year")
+            det_period_end = det.get("period_end")
+            if not period:
+                period = det.get("fiscal_period") or "FY"
+        if not period:
+            period = "FY"
+        if year is None:
+            return {"error": "Couldn't read the fiscal year from this PDF — enter "
+                             "it below and extract again.", "need_year": True}, 422
+        args.year, args.period = int(year), period
+        args._profile = qatar.profile_for_year(symbol, int(year))  # company+year-aware prompting
+
         filing = engine.extract_filing(pages, args)
         filing.setdefault("metadata", {}).update({
             "symbol": symbol, "sector": sector, "sub_sector": subsector,
@@ -624,6 +732,8 @@ def extract():
             "extracted_at": engine.datetime.now(engine.timezone.utc).isoformat(),
             "extractor": {"provider": cfg["name"], "model": cfg["model"]},
         })
+        if det_period_end and not filing["metadata"].get("period_end"):
+            filing["metadata"]["period_end"] = det_period_end
         problems = engine.validate_filing(filing)
         try:                                       # analysis must never sink a good extraction
             analysis = qscreen_analyze.analyze(symbol, [filing], args._profile)
@@ -875,6 +985,47 @@ def upload():
         return {"ok": True, "response": resp}
     except Exception as e:
         return {"error": str(e)}, 502
+
+
+def _is_loopback(addr: str | None) -> bool:
+    """True only for a request from this machine. Saving secrets must stay local
+    even if the app was bound to a LAN address (it has no authentication)."""
+    addr = addr or ""
+    return addr in {"127.0.0.1", "::1", "localhost"} or addr.startswith("::ffff:127.")
+
+
+@app.route("/settings", methods=["POST"])
+def settings():
+    """Save a cloud provider's API key to the .env next to the app and apply it
+    live — no terminal, no restart. Body: {provider, key, model?}. Local
+    providers need no key. Loopback only (see _is_loopback). The full key is
+    never echoed back."""
+    if not _is_loopback(request.remote_addr):
+        return {"error": "Saving a key is only allowed from this machine."}, 403
+    payload = request.get_json(silent=True) or {}
+    name = engine.canonical_provider(payload.get("provider")) or ""
+    key = (payload.get("key") or "").strip()
+    model = (payload.get("model") or "").strip()
+    cfg = engine.PROVIDERS.get(name)
+    if not cfg:
+        return {"error": f"unknown provider {payload.get('provider')!r}"}, 400
+    if cfg.get("local"):
+        return {"error": f"{cfg['label']} runs on your laptop and needs no API key."}, 400
+    if not key:
+        return {"error": "no API key provided"}, 400
+    env_var = cfg["env"][0]
+    try:
+        engine.set_dotenv_value(env_var, key)
+        # Force the provider the user just configured, so their new key is the
+        # one used even if another *_API_KEY is also present in .env.
+        engine.set_dotenv_value("QSCREEN_PROVIDER", name)
+        if model:
+            engine.set_dotenv_value("QSCREEN_MODEL", model)
+    except (ValueError, OSError) as e:
+        return {"error": f"could not save the key: {e}"}, 400
+    return {"ok": True, "provider": name, "label": cfg["label"], "env": env_var,
+            "masked_key": ("••••" + key[-4:]) if len(key) >= 4 else "••••",
+            "detected": engine.detect_provider()}
 
 
 def main() -> None:

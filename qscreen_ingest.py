@@ -103,6 +103,57 @@ def _load_dotenv() -> None:
 
 _load_dotenv()
 
+
+def set_dotenv_value(key: str, value: str, path: Path | None = None) -> Path:
+    """Write `KEY=value` into the `.env` next to this script (update in place or
+    create), apply it to os.environ immediately, and return the path.
+
+    The symmetric counterpart to _load_dotenv: same canonical location and the
+    same `export `/BOM tolerance. Used by the web app's Settings panel so a key
+    can be saved without a terminal or a restart. Other lines and comments are
+    preserved. Refuses anything but a plain ENV name, or a value containing a
+    newline, so a saved value can never inject extra `.env` lines.
+    """
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key or ""):
+        raise ValueError(f"invalid .env key: {key!r}")
+    value = "" if value is None else str(value)
+    if "\n" in value or "\r" in value:
+        raise ValueError("a .env value must not contain a newline")
+    if path is None:
+        path = Path(__file__).resolve().parent / ".env"
+    path = Path(path)
+
+    lines = path.read_text(encoding="utf-8-sig").splitlines() if path.is_file() else []
+    new_line = f"{key}={value}"
+    replaced = False
+    for i, raw in enumerate(lines):
+        stripped = raw.lstrip("\ufeff").strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        existing = stripped.partition("=")[0].strip()
+        if existing.startswith("export "):
+            existing = existing[len("export "):].strip()
+        if existing == key:
+            lines[i] = new_line
+            replaced = True
+            break
+    if not replaced:
+        lines.append(new_line)
+
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)               # secrets live here → keep it private
+    except OSError:
+        pass                               # best-effort (no-op on e.g. Windows)
+    os.replace(tmp, path)                  # atomic swap
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    os.environ[key] = value                # take effect without a restart
+    return path
+
 # Qatar per-stock knowledge base (optional import — the engine still runs without
 # it; when present it makes extraction company- and year-aware).
 try:
@@ -1383,6 +1434,102 @@ def detect_unit_scale(text: str) -> int | None:
         if pat.search(head):
             return scale
     return None
+
+
+# ── Fiscal year / period / period-end detection ──────────────────────────────
+# So the web app can read these off the filing instead of asking the user to
+# type them. Heuristic and QSE-oriented (cover page + statement headers); like
+# detect_unit_scale it scans only a head window and returns None when unsure.
+_MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12,
+}
+_DATE_DMY_RE = re.compile(
+    r"\b(\d{1,2})\s*(?:st|nd|rd|th)?\s+(" + "|".join(_MONTHS) + r")\s+(20\d{2})\b",
+    re.IGNORECASE)
+_DATE_ISO_RE = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
+# A date right after one of these phrases is the reporting (period-end) date —
+# trusted over a stray comparative year elsewhere on the cover.
+_PERIOD_END_ANCHOR_RE = re.compile(
+    r"(?:year|period|quarter|months?)\s+ended|ended\s+(?:on\s+)?|as\s+at|as\s+of|"
+    r"for\s+the\s+(?:year|period|quarter)", re.IGNORECASE)
+# Last resort for the year: a 4-digit year sitting next to a report title.
+_TITLE_YEAR_RE = re.compile(
+    r"(?:financial\s+statements|annual\s+report|annual\s+financial)\D{0,40}(20\d{2})"
+    r"|(20\d{2})\D{0,40}(?:financial\s+statements|annual\s+report)", re.IGNORECASE)
+# Interim signals → fiscal_period, checked most-specific first.
+_PERIOD_SIGNALS = [
+    ("9M", re.compile(r"nine[\s-]?months?|9\s*months|\b9M\b", re.IGNORECASE)),
+    ("H1", re.compile(r"six[\s-]?months?|6\s*months|half[\s-]?year|first\s+half", re.IGNORECASE)),
+    ("Q4", re.compile(r"fourth\s+quarter|\bQ4\b", re.IGNORECASE)),
+    ("Q3", re.compile(r"third\s+quarter|\bQ3\b", re.IGNORECASE)),
+    ("Q2", re.compile(r"second\s+quarter|\bQ2\b", re.IGNORECASE)),
+    ("Q1", re.compile(r"first\s+quarter|\bQ1\b", re.IGNORECASE)),
+]
+_THREE_MONTH_RE = re.compile(r"three[\s-]?months?|3\s*months", re.IGNORECASE)
+_ANNUAL_RE = re.compile(
+    r"year\s+ended|full[\s-]?year|annual\s+report|annual\s+financial|for\s+the\s+year",
+    re.IGNORECASE)
+_QUARTER_BY_MONTH = {3: "Q1", 6: "Q2", 9: "Q3", 12: "Q4"}
+
+
+def _parse_report_date(m: re.Match) -> tuple[str, int, int] | None:
+    """(iso_date, year, month) from a DMY or ISO date match, or None if absurd."""
+    if m.re is _DATE_ISO_RE:
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        day, month, year = int(m.group(1)), _MONTHS[m.group(2).lower()], int(m.group(3))
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    return f"{year:04d}-{month:02d}-{day:02d}", year, month
+
+
+def detect_fiscal_year_period(pages: list[dict]) -> dict:
+    """Best-effort read of {fiscal_year, fiscal_period, period_end} from a filing's
+    cover + first statement headers, so the web app need not ask the user to type
+    them. Returns None fields when unsure (the caller then falls back to manual
+    entry). period is from FISCAL_PERIODS; period_end is ISO YYYY-MM-DD.
+    """
+    out = {"fiscal_year": None, "fiscal_period": None, "period_end": None}
+    if not pages:
+        return out
+    head = "\n".join(p.get("text", "") for p in pages[:3])[:8000]
+
+    # 1) Period-end date: prefer a date that directly follows an "... ended" /
+    #    "as at" anchor; otherwise the first plausible date on the cover.
+    period_end = year = month = None
+    for am in _PERIOD_END_ANCHOR_RE.finditer(head):
+        window = head[am.end():am.end() + 40]
+        dm = _DATE_DMY_RE.search(window) or _DATE_ISO_RE.search(window)
+        if dm and (parsed := _parse_report_date(dm)):
+            period_end, year, month = parsed
+            break
+    if year is None:
+        dm = _DATE_DMY_RE.search(head) or _DATE_ISO_RE.search(head)
+        if dm and (parsed := _parse_report_date(dm)):
+            period_end, year, month = parsed
+
+    # 2) Fallback year: a 4-digit year next to a report title.
+    if year is None and (tm := _TITLE_YEAR_RE.search(head)):
+        year = int(tm.group(1) or tm.group(2))
+
+    # 3) Period: an interim signal (most specific first); else infer the quarter
+    #    from a "three months" period-end month; else FY when it reads annual.
+    period = None
+    for name, pat in _PERIOD_SIGNALS:
+        if pat.search(head):
+            period = name
+            break
+    if period is None and _THREE_MONTH_RE.search(head):
+        period = _QUARTER_BY_MONTH.get(month or 0)
+    if period is None and _ANNUAL_RE.search(head):
+        period = "FY"
+    if period not in FISCAL_PERIODS:
+        period = None
+
+    out.update(fiscal_year=year, fiscal_period=period, period_end=period_end)
+    return out
 
 
 _NUM_RE = re.compile(r"-?\d[\d,]*\.?\d*")

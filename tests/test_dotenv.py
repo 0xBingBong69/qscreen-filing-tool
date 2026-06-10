@@ -2,6 +2,8 @@
 self-diagnostic shown by --list-providers."""
 from __future__ import annotations
 
+import os
+
 import pytest
 
 import qscreen_ingest as e
@@ -105,3 +107,63 @@ def test_diagnostic_surfaces_wrong_variable(clean_env, monkeypatch):
     monkeypatch.setenv("MINIMAX_API_KEY", "sk-kimi-REDACTED")
     out = e.provider_diagnostic()
     assert "minimax" in out and "kimi" not in out
+
+
+# ── set_dotenv_value: write a key into .env, applied live (Settings panel) ───
+
+@pytest.fixture
+def restore_environ():
+    # set_dotenv_value writes os.environ directly (so a key takes effect without
+    # a restart); snapshot + restore so those writes don't leak across tests.
+    saved = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(saved)
+
+
+def test_set_dotenv_value_creates_and_roundtrips(tmp_path, restore_environ):
+    env = tmp_path / ".env"
+    e.set_dotenv_value("MINIMAX_API_KEY", "sk-new-123", path=env)
+    assert e._parse_dotenv(env.read_text())["MINIMAX_API_KEY"] == "sk-new-123"
+    assert os.environ["MINIMAX_API_KEY"] == "sk-new-123"     # live, no restart needed
+    assert (env.stat().st_mode & 0o777) == 0o600             # secrets → private file
+
+
+def test_set_dotenv_value_updates_in_place_and_preserves_rest(tmp_path, restore_environ):
+    env = tmp_path / ".env"
+    env.write_text("# header\nOPENAI_API_KEY=          # openai note\nINGEST_TOKEN=keepme\n")
+    e.set_dotenv_value("OPENAI_API_KEY", "sk-real", path=env)
+    text = env.read_text()
+    parsed = e._parse_dotenv(text)
+    assert parsed["OPENAI_API_KEY"] == "sk-real"             # updated in place …
+    assert parsed["INGEST_TOKEN"] == "keepme"                # … other keys untouched …
+    assert "# header" in text                                # … comments preserved
+    assert sum(ln.startswith("OPENAI_API_KEY=") for ln in text.splitlines()) == 1  # not duplicated
+
+
+def test_set_dotenv_value_appends_when_absent(tmp_path, restore_environ):
+    env = tmp_path / ".env"
+    env.write_text("OPENAI_API_KEY=sk-a\n")
+    e.set_dotenv_value("MINIMAX_API_KEY", "sk-b", path=env)
+    assert e._parse_dotenv(env.read_text()) == {"OPENAI_API_KEY": "sk-a", "MINIMAX_API_KEY": "sk-b"}
+
+
+def test_set_dotenv_value_handles_bom_and_export(tmp_path, restore_environ):
+    env = tmp_path / ".env"
+    env.write_text("\ufeff" + "export OPENAI_API_KEY=old\n", encoding="utf-8")
+    e.set_dotenv_value("OPENAI_API_KEY", "new", path=env)
+    text = env.read_text()
+    assert e._parse_dotenv(text)["OPENAI_API_KEY"] == "new"
+    assert sum("OPENAI_API_KEY" in ln for ln in text.splitlines()) == 1
+
+
+@pytest.mark.parametrize("key", ["bad key", "lower_case", "1LEADING", "WITH-DASH", ""])
+def test_set_dotenv_value_rejects_bad_keys(tmp_path, key):
+    with pytest.raises(ValueError):
+        e.set_dotenv_value(key, "x", path=tmp_path / ".env")
+
+
+def test_set_dotenv_value_rejects_newline_value(tmp_path):
+    # A newline in the value could otherwise inject a second .env line.
+    with pytest.raises(ValueError):
+        e.set_dotenv_value("OPENAI_API_KEY", "sk\nINJECTED=evil", path=tmp_path / ".env")
