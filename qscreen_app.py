@@ -76,6 +76,7 @@ def _subsector_options_html() -> str:
         out.append("</optgroup>")
     return "\n".join(out)
 
+BUILD = "ui-fix-1"
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>QScreen Filing Ingestor</title>
 <style>
@@ -124,6 +125,7 @@ PAGE = """<!doctype html>
 </style></head><body>
 <h1>QScreen Filing Ingestor</h1>
 <p class="sub">Drop a QSE financial-report PDF, pick the symbol &amp; sub-sector, click Extract — the fiscal year is read from the filing automatically. Then download the report and upload it to qscreen.app. Type a known symbol and the sub-sector auto-fills.</p>
+<p style="color:#0b6;font-size:13px;font-weight:600;margin-top:-4px">● build __BUILD__ — figures read offline, no API key needed</p>
 <form id="f">
   <label>Filing PDF</label>
   <input type="file" name="pdf" accept="application/pdf" required>
@@ -641,8 +643,11 @@ def index():
             .replace("__SYMBOL_MAP_JSON__", json.dumps(SYMBOL_SUBSECTOR))
             .replace("__PROVIDER_INFO_JSON__", json.dumps(provider_info))
             .replace("__DETECTED_PROVIDER_JSON__", json.dumps(engine.detect_provider()))
-            .replace("__UPLOAD_ENABLED__", "true" if upload_enabled else "false"))
-    return Response(html, mimetype="text/html")
+            .replace("__UPLOAD_ENABLED__", "true" if upload_enabled else "false")
+            .replace("__BUILD__", BUILD))
+    # never let the browser serve a stale page (old, broken inline JS)
+    return Response(html, mimetype="text/html",
+                    headers={"Cache-Control": "no-store, max-age=0"})
 
 
 @app.route("/extract", methods=["POST"])
