@@ -35,6 +35,10 @@ if [ ! -x ".venv/bin/python" ]; then
     read -r -p "  Press Enter to close…" _
     exit 1
   fi
+  # Optional offline reader for scanned pages — best-effort, never blocks startup.
+  echo "  Adding the scanned-page reader (optional)…"
+  ./.venv/bin/python -m pip install -r requirements-ocr.txt >/dev/null 2>&1 \
+    || echo "  (Scanned-page reader unavailable for this Python — everything else still works.)"
 fi
 
 # 3) Start the app (it opens your browser at http://127.0.0.1:8765)
