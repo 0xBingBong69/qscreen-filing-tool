@@ -245,8 +245,8 @@ function updateProvider() {
       ', then paste it in <b>Settings</b> below — saved for you, no terminal or restart needed.';
   } else {
     modelEl.placeholder = 'default';
-    provKey.innerHTML = '🔑 Save a cloud key in <b>Settings</b> below, ' +
-      'or pick a <b>local</b> model above to run fully offline with no key.';
+    provKey.innerHTML = '✅ <b>No API key needed</b> — the financial figures are read straight from ' +
+      'the PDF. Optionally save a key in <b>Settings</b> to also capture the audit opinion &amp; notes.';
   }
   updateMode();
 }
@@ -265,7 +265,9 @@ function updateMode() {
     modeHint.innerHTML = '🧭 <b>Basic.</b> Numbers are read from the PDF\'s tables in code; the model only ' +
       'fills gaps and classifies the audit opinion. Great for a tiny / local model (e.g. Gemma 3 270M via MLX).';
   } else {
-    modeHint.innerHTML = '🧭 <b>Auto.</b> Basic for local models, Pro for cloud models.';
+    modeHint.innerHTML = '🧭 <b>Auto (recommended).</b> The numbers are read from the PDF offline — ' +
+      '<b>no API key needed</b>. If you have saved a key in Settings, the model also fills the ' +
+      'audit opinion &amp; notes.';
   }
 }
 if (provEl) { provEl.addEventListener('change', updateProvider); }
@@ -669,7 +671,23 @@ def extract():
         provider = (request.form.get("provider") or "").strip() or None  # None → auto-detect
         model = (request.form.get("model") or "").strip() or None
         mode = (request.form.get("mode") or "auto").strip()   # auto | basic | pro
-        no_llm = bool(request.form.get("no_llm"))             # fully-offline checkbox
+        explicit_no_llm = bool(request.form.get("no_llm"))    # "fully offline" checkbox
+
+        # Is a usable model available? A saved cloud key (detect_provider) or a
+        # local provider picked in Advanced (those run with no key).
+        canon = engine.canonical_provider(provider) if provider else None
+        has_model = bool(engine.detect_provider()) or bool(
+            canon and engine.PROVIDERS.get(canon, {}).get("local"))
+        # DEFAULT ("auto"): always read the numbers offline; if a model is available,
+        # also let it fill the audit opinion and notes. No key → still get the numbers.
+        if mode == "auto":
+            no_llm = explicit_no_llm or not has_model
+            want_notes = has_model and not no_llm
+            force_basic = True
+        else:                                  # explicit Basic / Pro from Advanced
+            no_llm = explicit_no_llm
+            want_notes = bool(has_model and not no_llm and mode != "pro")
+            force_basic = (mode == "basic")
 
         # Build the same args object the CLI uses; resolve_provider picks the
         # base URL / model / key (from the matching env var) and validates them.
@@ -680,7 +698,7 @@ def extract():
             pages_per_chunk=12, overlap=1, no_chunk=False,
             no_json_mode=False, llm_key=None,
             mode=mode, basic=False, pro=False, no_llm=no_llm,
-            guided=False, no_guided=False, guided_notes=False,
+            guided=False, no_guided=False, guided_notes=want_notes,
         )
         engine.apply_mode(args)               # --mode/--no-llm → guided flags
         # Fully-offline (--no-llm) needs no provider at all; otherwise resolve it.
@@ -692,8 +710,9 @@ def extract():
             else:
                 raise
         args.guided = engine.resolve_guided(args, cfg)   # Basic vs Pro
-        if no_llm:
-            args.guided = True
+        if no_llm or force_basic:
+            args.guided = True                # numbers stay deterministic; model only fills gaps
+        args.guided_notes = want_notes
         if args.guided:
             args.pages_per_chunk = engine.GUIDED_DEFAULT_PAGES
 
@@ -1031,10 +1050,16 @@ def settings():
 def main() -> None:
     host = os.getenv("QSCREEN_APP_HOST", "127.0.0.1")
     port = int(os.getenv("QSCREEN_APP_PORT", "8765"))
-    print(f"\n  QScreen Filing Ingestor — open  http://{host}:{port}  in your browser\n")
+    url = f"http://{host}:{port}"
+    print(f"\n  QScreen Filing Ingestor — open  {url}  in your browser\n")
     if host not in ("127.0.0.1", "localhost", "::1"):
         print(f"  ⚠️  Binding to {host} exposes this tool (and any INGEST_TOKEN) on your "
               "network. It has no authentication — only do this on a trusted network.\n")
+    # Open the browser for the user (so non-technical users never copy a URL). The
+    # reloader is off, so this runs once; opt out with QSCREEN_NO_BROWSER=1.
+    if host in ("127.0.0.1", "localhost", "::1") and not os.getenv("QSCREEN_NO_BROWSER"):
+        import threading, webbrowser
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     app.run(host=host, port=port, debug=False)
 
 

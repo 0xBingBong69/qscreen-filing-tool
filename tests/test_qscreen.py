@@ -286,7 +286,11 @@ def test_ocr_auto_warns_when_unavailable(monkeypatch, tmp_path, capsys):
 
 def test_ocr_always_recovers_text(monkeypatch, tmp_path):
     path = _stub_pdf(monkeypatch, ["", ""], tmp_path)
-    monkeypatch.setattr(e, "_ocr_pages", lambda p, nums: {n: f"ocr-page-{n}" for n in nums})
+    # _ocr_pages now returns word boxes ({text,x0,x1,top} in points), not flat text.
+    monkeypatch.setattr(e, "_ocr_pages",
+                        lambda p, nums: {n: [{"text": f"ocr-page-{n}",
+                                              "x0": 0.0, "x1": 50.0, "top": 0.0}]
+                                         for n in nums})
     pages, _ = e.pdf_to_pages(path, ocr_mode="always")
     assert "ocr-page-1" in pages[0]["text"] and "ocr-page-2" in pages[1]["text"]
 

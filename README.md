@@ -9,31 +9,28 @@ Two modes: **local browser app** (drag-and-drop) or **one-command CLI**.
 
 ### New to this? Step-by-step (no coding experience needed)
 
-It runs on your own computer. Steps 1–4 are one-time.
+It runs on your own computer. Steps 1–2 are one-time.
 
 1. **Install Python** (free) from **[python.org/downloads](https://www.python.org/downloads/)** and run the installer.
    On **Windows**, tick **“Add Python to PATH”** on the first screen.
-2. **Download the tool.** At the top of this page click the green **`<> Code`** button → **Download ZIP**, then unzip it. Note the folder it makes.
-3. **Open a terminal in that folder:**
-   - **Mac:** right-click the folder → **New Terminal at Folder**.
-   - **Windows:** open the folder, click the address bar, type **`cmd`**, and press **Enter**.
-4. **Install the pieces it needs** — paste one line and press Enter:
-   - **Mac / Linux:** `python3 -m pip install flask pdfplumber requests`
-   - **Windows:** `python -m pip install flask pdfplumber requests`
-5. **Start the app:**
-   - **Mac / Linux:** `python3 qscreen_app.py`
-   - **Windows:** `python qscreen_app.py`
-6. **Use it.** Open your web browser to **http://127.0.0.1:8765**. In the **⚙️ Settings** panel, pick a provider, click its **Get a key** link to sign up, copy the key, paste it, and **Save** (just once). Then drag a PDF onto the page and click **Extract** — the symbol’s sub-sector and the **fiscal year fill in by themselves**. When it finishes, click **⬇ Download**.
+2. **Download the tool.** At the top of this page click the green **`<> Code`** button → **Download ZIP**, then unzip it.
+3. **Start it — just double-click:**
+   - **Windows:** double-click **`start.bat`**
+   - **Mac:** double-click **`start.command`** *(if it won’t open the first time, right-click it → **Open**)*
 
-To stop the app, switch to the terminal and press **Ctrl + C**. To run it again later, just repeat steps 5–6.
+   The first run installs what it needs (a few minutes), then **your web browser opens by itself**.
+4. **Use it.** Drag a PDF onto the page, type the company **symbol**, and click **Extract** — the sub-sector and the **fiscal year fill in by themselves**. When it finishes, click **⬇ Download**.
+
+> **You do not need an API key.** The financial figures — income statement, balance sheet (even a scanned, stamped one), cash flows — are read **offline, on your own computer**. An API key is *optional*: save one in the **⚙️ Settings** panel only if you also want the **audit opinion and note texts** captured.
+
+To stop the tool, close the window that opened. To run it again later, just double-click the launcher again (it starts in seconds after the first time).
 
 <details><summary><b>Something not working?</b></summary>
 
-- **`python3` / `python` “command not found”** — Python isn’t on your PATH. On Windows, reinstall and tick **“Add Python to PATH”**; on Mac, try the other word (`python` instead of `python3`).
-- **`pip` says “externally-managed-environment”** — make a private environment first, then redo step 4 in the same terminal:
-  `python3 -m venv .venv && source .venv/bin/activate` *(Windows: `python -m venv .venv && .venv\Scripts\activate`)*.
-- **The page won’t load** — keep the step-5 terminal window open (closing it stops the app), and use exactly `http://127.0.0.1:8765`.
-- **No API key, or don’t want to pay?** In the *Advanced* panel pick a **local** model (e.g. Ollama) to run with no key — see the offline-models section below.
+- **Nothing happens / “Python not found”** — install Python from the link in step 1 (on Windows, tick **“Add Python to PATH”**), then double-click the launcher again.
+- **Mac says it “can’t be opened”** — right-click **`start.command`** → **Open** → **Open**. You only need to do this the first time.
+- **The page won’t load** — keep the window the launcher opened, and use exactly `http://127.0.0.1:8765`.
+- **Want the audit opinion & notes too?** Save an API key in the **⚙️ Settings** panel (each provider has a **Get a key** link), or pick a **local** model under *Advanced* to do it with no key — see the offline-models section below.
 </details>
 
 ### Comfortable with a terminal?

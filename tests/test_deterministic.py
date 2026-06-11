@@ -296,3 +296,183 @@ def test_mlx_ignores_schema(monkeypatch):
     _u, _h, payload, _x = e._openai_request([{"role": "user", "content": "x"}], cfg, args)
     assert "format" not in payload                           # MLX gets no schema field
     assert payload.get("response_format") == {"type": "json_object"}
+
+
+# ── Word-position table recovery (borderless statements) ─────────────────────
+#
+# Most QSE statements have no ruled table lines, so pdfplumber's extract_tables()
+# returns nothing on the very pages that matter. _render_tables() then rebuilds a
+# grid from word x-positions and emits the same pipe format the parser consumes.
+
+class _FakeWordPage:
+    """A pdfplumber-like page exposing extract_tables()/extract_words()/lines."""
+    def __init__(self, words, tables=None, lines=None, width=595):
+        self._words, self._tables = words, tables or []
+        self.lines, self.width = lines or [], width
+    def extract_tables(self):
+        return self._tables
+    def extract_words(self, **_kw):
+        return self._words
+
+
+def _wrow(top, label, nums, x_label=50, x_first=300, dx=80):
+    """Word boxes for one statement row: a label then right-aligned number cells."""
+    ws = [{"text": label, "x0": x_label, "x1": x_label + len(label) * 5, "top": top}]
+    x = x_first
+    for n in nums:
+        ws.append({"text": n, "x0": x, "x1": x + len(n) * 6, "top": top})
+        x += dx
+    return ws
+
+
+def _income_words():
+    words, top = [], 100.0
+    for label, nums in [
+        ("Interest Income", ["25", "125,012,382", "125,322,712"]),
+        ("Net Interest Income", ["35,777,839", "32,819,319"]),
+        ("Fee and Commission Income", ["27", "9,537,651", "7,963,044"]),
+        ("Profit for the Year", ["17,353,776", "16,942,442"]),
+        ("Basic and Diluted Earnings Per Share", ["33", "1.74", "1.69"]),
+    ]:
+        words += _wrow(top, label, nums)
+        top += 12
+    return words
+
+
+def test_render_tables_word_fallback_basic():
+    block = e._render_tables(_FakeWordPage(_income_words()))
+    assert "-- table 1 --" in block
+    assert "Interest Income | 25 | 125,012,382 | 125,322,712" in block
+    assert "Net Interest Income | 35,777,839 | 32,819,319" in block
+
+
+def test_render_tables_prefers_ruled_when_present():
+    class _Boom(_FakeWordPage):
+        def extract_words(self, **_kw):
+            raise AssertionError("word fallback must not run when ruled tables exist")
+    page = _Boom(_income_words(), tables=[[["A", "1", "2"], ["B", "3", "4"]]])
+    block = e._render_tables(page)
+    assert "A | 1 | 2" in block and "B | 3 | 4" in block      # came from the ruled path
+
+
+def test_merge_number_fragments_repairs_split_number():
+    # "22,022,946" arrives as "2" + "2,022,946" across a ~0pt gap → re-joined
+    ws = [{"text": "2", "x0": 300, "x1": 306, "top": 0},
+          {"text": "2,022,946", "x0": 307, "x1": 360, "top": 0}]
+    assert e._merge_number_fragments(ws)[0]["text"] == "22,022,946"
+    # a leading-comma fragment ("2" + ",607,153") is also re-joined
+    ws2 = [{"text": "2", "x0": 300, "x1": 306, "top": 0},
+           {"text": ",607,153", "x0": 307, "x1": 360, "top": 0}]
+    assert e._merge_number_fragments(ws2)[0]["text"] == "2,607,153"
+    # a real inter-column gap is NOT merged
+    ws3 = [{"text": "2", "x0": 300, "x1": 306, "top": 0},
+           {"text": "2,022,946", "x0": 400, "x1": 460, "top": 0}]
+    assert len(e._merge_number_fragments(ws3)) == 2
+
+
+def test_word_fallback_handles_xspace_artifact_end_to_end():
+    words = [
+        {"text": "Profit Before Income Taxes", "x0": 50, "x1": 200, "top": 0},
+        {"text": "2", "x0": 300, "x1": 306, "top": 0},
+        {"text": "2,022,946", "x0": 307, "x1": 360, "top": 0},
+        {"text": "19,766,518", "x0": 440, "x1": 500, "top": 0},
+    ]
+    words += _wrow(12, "Interest Income", ["125,012,382", "125,322,712"])
+    words += _wrow(24, "Net Interest Income", ["35,777,839", "32,819,319"])
+    words += _wrow(36, "Profit for the Year", ["17,353,776", "16,942,442"])
+    block = e._words_to_table_rows(words)
+    assert "Profit Before Income Taxes | 22,022,946 | 19,766,518" in block
+
+
+def test_split_label_and_numbers_shapes_a_triplet():
+    ws = [{"text": "Interest Income", "x0": 50, "x1": 150, "top": 0},
+          {"text": "25", "x0": 300, "x1": 312, "top": 0},
+          {"text": "125,012,382", "x0": 400, "x1": 470, "top": 0},
+          {"text": "125,322,712", "x0": 500, "x1": 570, "top": 0}]
+    cells, n = e._split_label_and_numbers(ws)
+    assert cells == ["Interest Income", "25", "125,012,382", "125,322,712"] and n == 3
+
+
+def test_word_fallback_skips_wide_matrix():
+    # a statement-of-changes-in-equity matrix: many numeric columns per row
+    words, top = [], 100.0
+    for i in range(4):
+        ws = [{"text": f"Movement {i}", "x0": 50, "x1": 120, "top": top}]
+        x = 200
+        for j in range(5):
+            ws.append({"text": f"{1000 + i * 10 + j:,}", "x0": x, "x1": x + 50, "top": top})
+            x += 80
+        words += ws
+        top += 12
+    assert e._words_to_table_rows(words) == ""
+
+
+def test_word_fallback_skips_prose_page():
+    words = [{"text": w, "x0": 50 + i * 35, "x1": 70 + i * 35, "top": 100}
+             for i, w in enumerate("this is plain prose with no aligned columns at all".split())]
+    assert e._words_to_table_rows(words) == ""
+
+
+# ── OCR path: [OCR TABLES] blocks tag line items basis="ocr" ─────────────────
+
+def test_ocr_block_tags_basis_and_parses_negatives():
+    win = ("\n===== PAGE 7 =====\nConsolidated Statement of Financial Position\n"
+           "[OCR TABLES on page 7]\n-- table 1 --\n"
+           "Cash and Balances with Central Banks | 8 | 79,489,167 | 84,535,430\n"
+           "Total Assets | 1,391,346,423 | 1,297,916,820\n"
+           "Net result | (1,234) | (2,000)\n"
+           "Loans and Advances to Customers | 10 | 1,018,078,852 | 910,757,751\n")
+    titles = e.detect_statement_titles(win)
+    det = e.deterministic_statements(win, titles, "2024", "2025")
+    bs = det["balance_sheet"]
+    assert bs["line_items"] and all(li["basis"] == "ocr" for li in bs["line_items"])
+    cash = next(li for li in bs["line_items"] if li["label_verbatim"].startswith("Cash"))
+    assert cash["account_code"] == "BS_CASH" and cash["value"] == 79489167
+    neg = next(li for li in bs["line_items"] if li["label_verbatim"] == "Net result")
+    assert neg["value"] == -1234 and neg["comparatives"][0]["value"] == -2000
+
+
+def test_parse_rendered_tables_marks_ocr_blocks():
+    text = ("[TABLES on page 1]\n-- table 1 --\nA | 1 | 2\n"
+            "[OCR TABLES on page 7]\n-- table 1 --\nB | 3 | 4\n")
+    tabs = e.parse_rendered_tables(text)
+    assert tabs[0]["page"] == 1 and tabs[0]["ocr"] is False
+    assert tabs[1]["page"] == 7 and tabs[1]["ocr"] is True
+
+
+# ── Title detection: notes boundary, squashed OCR headings, date rows ────────
+
+def test_detect_titles_ignores_post_notes_subheadings():
+    text = ("Notes to the Consolidated Financial Statements\n"
+            "Statement of Financial Position Items\nx 1 2\n"
+            "Income Statement Items\ny 3 4\n")
+    assert e.detect_statement_titles(text) == []
+
+
+def test_detect_titles_primary_before_notes_only():
+    text = ("Consolidated Statement of Financial Position\n2025 2024\n"
+            "Notes to the Consolidated Financial Statements\nIncome Statement Items\n")
+    assert [t for t, _, _ in e.detect_statement_titles(text)] == ["balance_sheet"]
+
+
+def test_detect_titles_squashed_ocr_heading():
+    assert [t for t, _, _ in e.detect_statement_titles("ConsolidatedStatementofFinancialPosition\n")] \
+        == ["balance_sheet"]
+
+
+def test_date_header_row_dropped():
+    win = ("Consolidated Income Statement\n[TABLES on page 1]\n-- table 1 --\n"
+           "For the Year Ended | 31 | 2025\n"
+           "Interest Income | 100 | 90\n")
+    titles = e.detect_statement_titles(win)
+    det = e.deterministic_statements(win, titles, "2024", "2025")
+    labels = [li["label_verbatim"] for li in det["income_statement"]["line_items"]]
+    assert "Interest Income" in labels
+    assert not any(l.lower().startswith("for the year") for l in labels)
+
+
+def test_map_label_to_code_space_insensitive_for_ocr():
+    assert e.map_label_to_code("CashandBalanceswithCentralBanks", "balance") == "BS_CASH"
+    assert e.map_label_to_code("TotalAssets", "balance") == "BS_TOTAL_ASSETS"
+    # a normal spaced label is unaffected
+    assert e.map_label_to_code("Net interest income", "income") == "IS_NET_INTEREST"
