@@ -38,9 +38,11 @@ To stop the tool, close the window that opened. To run it again later, just doub
 **Browser app:**
 
 ```bash
-pip install flask pdfplumber requests      # one-time
-python3 qscreen_app.py                      # then open http://127.0.0.1:8765
+pip install flask pdfplumber requests
+python3 qscreen_app.py
 ```
+
+The first line installs the dependencies once; `python3 qscreen_app.py` starts the app and opens your browser.
 
 Save your API key once in the **⚙️ Settings** panel, then drag in a PDF and click **Extract** —
 the fiscal year & period are read from the filing automatically. No key? Pick a **local** model
@@ -75,9 +77,11 @@ Re-run anytime to update.
 **Option 2 — pip** (installs the `qscreen-ingest` and `qscreen-app` commands):
 
 ```bash
-pip install -e .                 # core
-pip install -e ".[xlsx,ocr]"     # + Excel export and OCR for scanned PDFs
+pip install -e .
+pip install -e ".[xlsx,ocr]"
 ```
+
+The second line adds the optional extras: `xlsx` (Excel export) and `ocr` (read scanned pages offline).
 
 ## Configure (once)
 
@@ -162,7 +166,7 @@ Pro for cloud models; force either with `--basic` / `--pro` (or `--mode basic|pr
 
 ```bash
 pip install mlx-lm
-mlx_lm.server --model mlx-community/gemma-3-270m-it-4bit       # serves localhost:8080
+mlx_lm.server --model mlx-community/gemma-3-270m-it-4bit
 
 python3 qscreen_ingest.py report.pdf --provider mlx --basic \
   --symbol QIBK --sector islamic_bank --year 2024 --period FY --dry-run
@@ -193,7 +197,7 @@ output is the **same lossless filing contract** as Pro.
 ## Option A — local browser app
 
 ```bash
-python3 qscreen_app.py            # or: qscreen-app
+python3 qscreen_app.py
 ```
 
 Open **http://127.0.0.1:8765**, drag in a PDF, type the Symbol (a known symbol
@@ -434,9 +438,11 @@ In the browser, the **Dashboard** button (in the compare/screen panel) takes sev
 ## Testing
 
 ```bash
-python3 qscreen_ingest.py --self-test     # offline contract/normalize/merge check
-pytest -q                                 # full suite (pip install -e ".[dev]")
+python3 qscreen_ingest.py --self-test
+pytest -q
 ```
+
+`--self-test` is the offline contract/normalize/merge check; `pytest -q` runs the full suite (after `pip install -e ".[dev]"`).
 
 The self-test must print `✅ self-test passed`. CI runs both on Python 3.9–3.12.
 
