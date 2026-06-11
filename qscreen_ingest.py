@@ -2565,10 +2565,19 @@ def run_filing(args) -> int:
     try:
         cfg = resolve_provider(args)    # fail fast on bad provider/key before any work
     except SystemExit:
+        explicit = getattr(args, "provider", None) or getattr(args, "llm_key", None)
         if no_llm:
             cfg = deterministic_cfg()   # fully offline — no provider needed at all
+        elif not explicit:
+            # Auto default: no key configured → read the numbers offline instead of
+            # failing. Set a provider key (or pass --no-llm) to change this.
+            print("ℹ️  No API key found — reading the numbers offline (deterministic). "
+                  "Add a provider key to .env to also capture the audit opinion & notes.")
+            cfg = deterministic_cfg()
+            no_llm = True
+            args.no_llm = True
         else:
-            raise
+            raise                       # they asked for a specific provider/key — surface it
     args.guided = resolve_guided(args, cfg)   # small/local models → Basic by default
     if no_llm:
         args.guided = True              # the deterministic-first orchestrator lives in Basic
