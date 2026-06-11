@@ -34,6 +34,10 @@ if not exist ".venv\Scripts\python.exe" (
   ".venv\Scripts\python.exe" -m pip install --upgrade pip >nul 2>nul
   ".venv\Scripts\python.exe" -m pip install -r requirements.txt
   if errorlevel 1 ( echo   Install failed - please check your internet connection and try again. & pause & exit /b 1 )
+  REM Optional offline reader for scanned pages - best-effort, never blocks startup.
+  echo   Adding the scanned-page reader ^(optional^)...
+  ".venv\Scripts\python.exe" -m pip install -r requirements-ocr.txt
+  if errorlevel 1 echo   (Scanned-page reader unavailable for this Python - everything else still works.)
 )
 
 REM 3) Start the app (it opens your browser at http://127.0.0.1:8765)

@@ -1,0 +1,8 @@
+# Optional: read scanned statement pages (e.g. a stamped balance sheet) offline.
+# Pure pip install — no system software (no tesseract, no poppler) needed.
+#
+# This is BEST-EFFORT: if no compatible wheel exists for your Python version,
+# installing it may fail. That's fine — the tool still reads everything else;
+# only scanned pages are skipped. (Unpinned so pip picks whatever your Python
+# supports — e.g. older Pythons get newer builds, Python 3.13 gets 1.2.x.)
+rapidocr-onnxruntime

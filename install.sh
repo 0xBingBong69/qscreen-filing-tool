@@ -30,8 +30,11 @@ else
   git clone --depth 1 --branch main "$REPO" "$DEST"
 fi
 
-echo "🐍 ensuring python deps (incl. offline OCR for scanned pages) …"
+echo "🐍 ensuring python deps …"
 python3 -m pip install --quiet --upgrade -r "$DEST/requirements.txt"
+echo "🔎 adding the offline scanned-page reader (optional) …"
+python3 -m pip install --quiet --upgrade -r "$DEST/requirements-ocr.txt" \
+  || echo "   (Scanned-page reader unavailable for this Python — everything else still works.)"
 
 echo "🧪 self-test …"
 python3 "$TOOL" --self-test
