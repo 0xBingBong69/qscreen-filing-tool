@@ -524,21 +524,114 @@ class OcrUnavailable(RuntimeError):
     """Raised when OCR is requested but pytesseract/pdf2image aren't installed."""
 
 
-def _ocr_pages(pdf_path: str, page_numbers: list[int]) -> dict[int, str]:
-    """OCR specific 1-based page numbers; returns {page_num: text}."""
-    try:
-        import pytesseract
-        from pdf2image import convert_from_path
-    except Exception as e:  # missing python deps OR missing system tesseract/poppler
-        raise OcrUnavailable(str(e))
-    out: dict[int, str] = {}
-    for n in page_numbers:
+_RAPIDOCR_ENGINE = None
+
+
+def _get_rapidocr():
+    """Lazily build a RapidOCR engine (pip-only ONNX OCR, no system binary)."""
+    global _RAPIDOCR_ENGINE
+    if _RAPIDOCR_ENGINE is None:
         try:
-            images = convert_from_path(pdf_path, first_page=n, last_page=n, dpi=OCR_DPI)
+            from rapidocr_onnxruntime import RapidOCR
+        except Exception as e:                 # not installed
+            raise OcrUnavailable(str(e))
+        _RAPIDOCR_ENGINE = RapidOCR()
+    return _RAPIDOCR_ENGINE
+
+
+def _render_page_bitmaps(pdf_path: str, page_numbers: list[int], dpi: int) -> dict:
+    """Render 1-based pages to RGB PIL images via pypdfium2 (no poppler / system deps).
+
+    Returns {page_num: (image, scale)} where scale = dpi/72 px-per-point, so OCR box
+    pixels can be converted back to PDF points (pixels / scale).
+    """
+    import pypdfium2 as pdfium
+    out: dict = {}
+    pdf = pdfium.PdfDocument(pdf_path)
+    try:
+        scale = dpi / 72.0
+        n_pages = len(pdf)
+        for n in page_numbers:
+            if 1 <= n <= n_pages:
+                try:
+                    img = pdf[n - 1].render(scale=scale).to_pil().convert("RGB")
+                except Exception:
+                    continue
+                out[n] = (img, scale)
+    finally:
+        pdf.close()
+    return out
+
+
+def _ocr_image_words(img, scale: float) -> list[dict]:
+    """OCR one image → word boxes {text,x0,x1,top} in PDF points (px / scale).
+
+    RapidOCR (ONNX, pip-only) is preferred; pytesseract is a fallback for users who
+    already have the system tesseract binary. Both go through the same word-box shape.
+    """
+    try:
+        engine = _get_rapidocr()
+    except OcrUnavailable:
+        engine = None
+    if engine is not None:
+        import numpy as np
+        result, _ = engine(np.asarray(img))
+        words: list[dict] = []
+        for box, text, _score in (result or []):
+            xs = [pt[0] for pt in box]
+            ys = [pt[1] for pt in box]
+            words.append({"text": str(text), "x0": min(xs) / scale,
+                          "x1": max(xs) / scale, "top": min(ys) / scale})
+        return words
+    import pytesseract                          # fallback — needs the tesseract binary
+    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    words = []
+    for i, text in enumerate(data["text"]):
+        if text and text.strip():
+            words.append({"text": text, "x0": data["left"][i] / scale,
+                          "x1": (data["left"][i] + data["width"][i]) / scale,
+                          "top": data["top"][i] / scale})
+    return words
+
+
+def _ocr_flat_text(words: list[dict]) -> str:
+    """Readable verbatim text from OCR word boxes — rows top-down, words left-right."""
+    rows: list[dict] = []
+    for w in sorted(words, key=lambda w: (round(w["top"]), w["x0"])):
+        for r in rows:
+            if abs(r["top"] - w["top"]) <= _OCR_ROW_TOL:
+                r["ws"].append(w)
+                break
+        else:
+            rows.append({"top": w["top"], "ws": [w]})
+    rows.sort(key=lambda r: r["top"])
+    return "\n".join(" ".join(x["text"] for x in sorted(r["ws"], key=lambda w: w["x0"]))
+                     for r in rows)
+
+
+def _ocr_pages(pdf_path: str, page_numbers: list[int]) -> dict[int, list[dict]]:
+    """OCR specific 1-based pages → {page_num: [word boxes in PDF points]}.
+
+    Renders with pypdfium2 (no poppler) and recognises with RapidOCR (no tesseract),
+    so offline OCR works from a plain `pip install` with no system software. Raises
+    OcrUnavailable only when neither RapidOCR nor pytesseract can be imported.
+    """
+    try:                                        # probe an engine up-front
+        _get_rapidocr()
+    except OcrUnavailable:
+        try:
+            import pytesseract  # noqa: F401
+        except Exception as e:
+            raise OcrUnavailable(str(e))
+    bitmaps = _render_page_bitmaps(pdf_path, page_numbers, OCR_DPI)
+    out: dict[int, list[dict]] = {}
+    for n, (img, scale) in bitmaps.items():
+        try:
+            words = _ocr_image_words(img, scale)
         except Exception:
             continue
-        if images:
-            out[n] = pytesseract.image_to_string(images[0]) or ""
+        if words:
+            out[n] = words
     return out
 
 
@@ -573,17 +666,21 @@ def pdf_to_pages(pdf_path: str, ocr_mode: str = "auto") -> tuple[list[dict], str
             ocr_map = _ocr_pages(pdf_path, targets)
             recovered = 0
             for p in pages:
-                add = (ocr_map.get(p["num"]) or "").strip()
-                if add:
-                    p["text"] = (f"{p['text']}\n\n[OCR text]\n{add}"
-                                 if p["text"].strip() else add)
-                    recovered += 1
+                words = ocr_map.get(p["num"]) or []
+                if not words:
+                    continue
+                add = _ocr_flat_text(words)             # readable verbatim text
+                block = _words_to_table_rows(words, row_tol=_OCR_ROW_TOL)
+                if block:                                # recovered a numeric table too
+                    add = f"{add}\n\n[OCR TABLES on page {p['num']}]\n{block}"
+                p["text"] = (f"{p['text']}\n\n[OCR text]\n{add}"
+                             if p["text"].strip() else add)
+                recovered += 1
             if recovered:
                 print(f"   🔎 OCR recovered text from {recovered} page(s)")
         except OcrUnavailable:
             scanned = len([p for p in pages if len(p["text"].strip()) < OCR_MIN_CHARS])
-            msg = ("OCR is not available (install: pip install pytesseract pdf2image, "
-                   "plus system 'tesseract' and 'poppler')")
+            msg = ("OCR is not available (install it with: pip install rapidocr-onnxruntime)")
             if ocr_mode == "always":
                 raise SystemExit(f"--ocr always requested but {msg}.")
             print(f"   ⚠️  {scanned} page(s) have little/no extractable text (likely "
@@ -591,12 +688,33 @@ def pdf_to_pages(pdf_path: str, ocr_mode: str = "auto") -> tuple[list[dict], str
     return pages, sha
 
 
+# Word-position table recovery for borderless statements ─────────────────────
+#
+# Most QSE financial statements are typeset with NO ruling lines, so pdfplumber's
+# line-based page.extract_tables() finds nothing on exactly the pages that matter
+# (income statement, balance sheet, cash flows). The numbers are still there in
+# the text layer — aligned into columns by x-position. When the ruled path comes
+# up empty we rebuild the grid from word positions and emit the SAME pipe format
+# _render_tables already produces, so the whole deterministic pipeline downstream
+# (parse_rendered_tables → _row_to_triplet → deterministic_statements) is reused
+# unchanged. The same helper also serves the OCR path (it takes generic boxes).
+_WORD_ROW_TOL = 3.0          # vertical tolerance (pt) for grouping words into one row
+_OCR_ROW_TOL = 6.0           # looser tolerance for OCR boxes (noisier top coordinates)
+_WORD_MERGE_GAP = 3.0        # max x-gap (pt) to re-join a split number fragment
+_WORD_MIN_NUMERIC_ROWS = 4   # a page needs this many label+number rows to be a "table"
+# A numeric token or fragment (optionally bracketed/signed). Allows a leading comma
+# so a split thousands group ("2" + ",607,153") is recognised and re-joined.
+_FRAG_RE = re.compile(r"^[\(\)]?[-+]?[\d,]*\d[\d,]*(?:\.\d+)?\)?$")
+# A cell that is actually a number (has at least one digit, maybe a % suffix).
+_NUMERIC_CELL_RE = re.compile(r"^[\(\)]?[-+]?\d[\d,]*\.?\d*\)?%?$")
+
+
 def _render_tables(page) -> str:
     out_lines: list[str] = []
     try:
         tables = page.extract_tables() or []
     except Exception:
-        return ""
+        tables = []
     for ti, table in enumerate(tables, 1):
         if not table or len(table) < 2:
             continue
@@ -605,7 +723,117 @@ def _render_tables(page) -> str:
             cells = [("" if c is None else str(c).replace("\n", " ").strip()) for c in row]
             if any(cells):
                 out_lines.append(" | ".join(cells))
-    return "\n".join(out_lines)
+    if out_lines:
+        return "\n".join(out_lines)
+    # No ruled table on this page → rebuild one from word x-positions (borderless
+    # statements). Returns "" for prose pages, so nothing noisy is emitted.
+    return _reconstruct_tables_from_words(page)
+
+
+def _merge_number_fragments(words: list[dict]) -> list[dict]:
+    """Re-join numeric fragments that the text layer split across a ~0pt gap.
+
+    pdfplumber occasionally breaks one figure into two tokens with no real gap —
+    "22,022,946" → "2" + "2,022,946"; "992,761" → "9" + "92,761"; "(24,029,425)" →
+    "(" + "24,029,425)". We glue adjacent numeric tokens only when the x-gap is
+    tiny (real inter-column gaps are far wider) AND the result carries a separator
+    or ≥2 digits, so two genuinely separate single-digit columns are never merged.
+    """
+    out: list[dict] = []
+    for w in words:
+        if out:
+            prev = out[-1]
+            gap = w["x0"] - prev["x1"]
+            prev_num = bool(_FRAG_RE.match(prev["text"])) or prev["text"] == "("
+            cur_num = bool(_FRAG_RE.match(w["text"]))
+            if gap <= _WORD_MERGE_GAP and prev_num and cur_num:
+                combined = prev["text"] + w["text"]
+                if ("," in combined) or ("." in combined) \
+                        or sum(c.isdigit() for c in combined) >= 2:
+                    out[-1] = {"text": combined, "x0": prev["x0"],
+                               "x1": w["x1"], "top": prev["top"]}
+                    continue
+        out.append({"text": w["text"], "x0": w["x0"], "x1": w["x1"], "top": w["top"]})
+    return out
+
+
+def _split_label_and_numbers(words: list[dict]) -> tuple[list[str], int]:
+    """x-sorted word boxes → ['label', 'num', 'num', ...] cells + numeric count.
+
+    Everything left of the first numeric token is the label (internal spaces kept);
+    the rest become number cells — exactly the shape _row_to_triplet expects.
+    """
+    label_parts: list[str] = []
+    num_cells: list[str] = []
+    started = False
+    for w in words:
+        t = (w.get("text") or "").strip()
+        if not t:
+            continue
+        if _NUMERIC_CELL_RE.match(t) and any(c.isdigit() for c in t):
+            started = True
+        (num_cells if started else label_parts).append(t)
+    label = " ".join(label_parts).strip()
+    cells = ([label] if label else []) + num_cells
+    n_nums = sum(1 for c in num_cells if any(ch.isdigit() for ch in c))
+    return cells, n_nums
+
+
+def _words_to_table_rows(words: list[dict], row_tol: float = _WORD_ROW_TOL) -> str:
+    """Cluster generic word boxes ({text,x0,x1,top}) into a pipe-delimited table.
+
+    Returns the `-- table 1 --` block (same format _render_tables emits) or "" when
+    the page is prose / a wide matrix and should not be treated as a statement table.
+    Shared by the born-digital path (pdfplumber words, tight tol) and the OCR path
+    (OCR boxes normalised to points, looser tol). Coordinates must be in PDF points.
+    """
+    items = [w for w in words if (w.get("text") or "").strip()]
+    if not items:
+        return ""
+    rows: list[dict] = []
+    for w in sorted(items, key=lambda w: (round(w["top"]), w["x0"])):
+        for r in rows:
+            if abs(r["top"] - w["top"]) <= row_tol:
+                r["ws"].append(w)
+                break
+        else:
+            rows.append({"top": w["top"], "ws": [w]})
+    rows.sort(key=lambda r: r["top"])
+
+    built: list[list[str]] = []
+    numeric_rows = 0
+    wide_rows = 0
+    for r in rows:
+        merged = _merge_number_fragments(sorted(r["ws"], key=lambda w: w["x0"]))
+        cells, n_nums = _split_label_and_numbers(merged)
+        if not cells:
+            continue
+        built.append(cells)
+        if n_nums >= 1 and any(re.search(r"[A-Za-z]", c) for c in cells):
+            numeric_rows += 1
+        if n_nums >= 4:
+            wide_rows += 1
+    if numeric_rows < _WORD_MIN_NUMERIC_ROWS:
+        return ""                       # prose page — don't emit a noisy block
+    if wide_rows >= 2:
+        return ""                       # wide matrix (changes-in-equity) — never a triplet
+    out = ["-- table 1 --"]
+    for cells in built:
+        if any(c.strip() for c in cells):
+            out.append(" | ".join(cells))
+    return "\n".join(out) if len(out) > 1 else ""
+
+
+def _reconstruct_tables_from_words(page) -> str:
+    """Word-position fallback for a pdfplumber page with no ruled tables."""
+    try:
+        words = page.extract_words(use_text_flow=False, keep_blank_chars=False) or []
+    except Exception:                   # a page object without extract_words (e.g. a stub)
+        return ""
+    norm = [{"text": w.get("text", ""), "x0": float(w.get("x0", 0.0)),
+             "x1": float(w.get("x1", 0.0)), "top": float(w.get("top", 0.0))}
+            for w in words]
+    return _words_to_table_rows(norm)
 
 
 def page_windows(pages: list[dict], size: int, overlap: int) -> list[list[dict]]:
@@ -1396,24 +1624,101 @@ def map_label_to_code(label: str, stype: str | None = None) -> str | None:
         for code, phrases in _LABEL_RULES.get(group, ()):
             if any(ph in text for ph in phrases):
                 return code if code in KNOWN_ACCOUNT_CODES else None
+    # Fallback: OCR sometimes drops the spaces ("cashandbalanceswithcentralbanks").
+    # Only reached when nothing matched above, so spaced labels are unaffected.
+    squashed = text.replace(" ", "")
+    for group in groups:
+        for code, phrases in _LABEL_RULES.get(group, ()):
+            if any(ph.replace(" ", "") in squashed for ph in phrases):
+                return code if code in KNOWN_ACCOUNT_CODES else None
     return None
+
+
+# A real statement heading is its own short line — optional qualifiers then the
+# phrase. We deliberately DON'T accept "parent"/"separate" here so the parent-bank
+# supplementary statements (and prose that merely mentions a statement) are not
+# mistaken for the consolidated primary statements.
+_TITLE_QUALIFIER = (r"(?:the\s+|consolidated\s+|interim\s+|condensed\s+|group\s+|"
+                    r"unaudited\s+|reviewed\s+|audited\s+)*")
+_TITLE_RES: list[tuple] = [(re.compile(_TITLE_QUALIFIER + pat, re.IGNORECASE), stype)
+                           for pat, stype in STATEMENT_TITLE_PATTERNS]
+# Space-insensitive variants: OCR sometimes renders a heading with no spaces
+# ("ConsolidatedStatementofFinancialPosition"). Drop the spaces / \s+ from both the
+# qualifier and each phrase so the squashed line still matches (still start-anchored).
+def _squash_re_src(p: str) -> str:
+    return p.replace(r"\s+", "").replace(" ", "")
+_TITLE_RES_SQ: list[tuple] = [
+    (re.compile(_squash_re_src(_TITLE_QUALIFIER) + _squash_re_src(pat), re.IGNORECASE), stype)
+    for pat, stype in STATEMENT_TITLE_PATTERNS]
+# Start of the notes / supplementary section — primary statements end here.
+_NOTES_BOUNDARY_RE = re.compile(
+    r"(?:notes\s+to\s+the|supplementary\s+information\s+to\s+the)\s+"
+    r"(?:consolidated\s+|interim\s+|condensed\s+|separate\s+|annual\s+)*"
+    r"financial\s+statements", re.IGNORECASE)
+# A non-item row: a period/date header ("For the Year Ended …", "As at 31 December")
+# or the boilerplate footer ("The attached notes 1 to 40 form an integral part …").
+# Never a real line item; dropped when it carries no account code.
+_NONITEM_LABEL_RE = re.compile(
+    r"^\s*(?:for\s+the\s+(?:year|period|quarter|half|three|six|nine|twelve|\d)|"
+    r"as\s+at|as\s+of|year\s+ended|period\s+ended|"
+    r"the\s+(?:attached|accompanying)\s+notes)\b", re.IGNORECASE)
 
 
 def detect_statement_titles(text: str) -> list[tuple[str, str, int]]:
     """Find financial-statement headings in page text.
 
     Returns (statement_type, matched_title, start_index) sorted by position, at
-    most one entry per statement type (the first occurrence), so we can slice the
-    text around each statement and feed the model just that.
+    most one entry per statement type (the first occurrence). A heading must sit on
+    its own short line that STARTS with the statement phrase (after optional
+    qualifiers) and isn't a prose sentence — so "off-balance sheet items", "(i)
+    Statement of Financial Position" (parent supplement) and "...the consolidated
+    statement of financial position when…" no longer false-trigger a statement.
     """
+    # The primary statements always precede the notes / parent-company supplement.
+    # Anything after that boundary ("Income Statement Items" inside a related-party
+    # note, the parent-bank "(i) Statement of Financial Position", …) is NOT a
+    # primary statement, so we stop detecting once we cross it.
+    bm = _NOTES_BOUNDARY_RE.search(text)
+    notes_at = bm.start() if bm else None
     found: dict[str, tuple[str, int]] = {}
-    for pat, stype in STATEMENT_TITLE_PATTERNS:
-        if stype in found:
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        line_pos = pos + (len(line) - len(line.lstrip()))
+        pos += len(line)
+        if not stripped or len(stripped) > 120:
             continue
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            found[stype] = (m.group(0).strip(), m.start())
+        if notes_at is not None and line_pos >= notes_at:
+            break                          # crossed into the notes — stop detecting
+        for rx, stype in _TITLE_RES:
+            if stype in found:
+                continue
+            m = rx.match(stripped)
+            if m and _heading_tail_ok(stripped[m.end():]):
+                found[stype] = (stripped, line_pos)
+        sq = re.sub(r"\s+", "", stripped)              # OCR no-space heading fallback
+        for rx, stype in _TITLE_RES_SQ:
+            if stype in found:
+                continue
+            m = rx.match(sq)
+            if m and _heading_tail_ok(sq[m.end():]):
+                found[stype] = (stripped, line_pos)
     return sorted(((st, t, i) for st, (t, i) in found.items()), key=lambda x: x[2])
+
+
+def _heading_tail_ok(rest: str) -> bool:
+    """True when whatever follows the statement phrase looks like a heading tail —
+    empty, a parenthetical "(Continued)", a date clause ("For/As at the year…"), an
+    "and other comprehensive income" continuation, or a number. Rejects a trailing
+    noun such as "Items"/"Transactions"/"Balances", which marks a NOTE subsection
+    ("Income Statement Items") rather than a primary statement.
+    """
+    rest = rest.strip().lower()
+    if not rest:
+        return True
+    if rest[0].isdigit() or rest[0] in "(:–-—":
+        return True
+    return rest.startswith(("for ", "as ", "and ", "to ", "of "))
 
 
 # Require a unit word to sit in an amount/currency context — so a stray
@@ -1635,7 +1940,7 @@ def _slice_statements(text: str, titles: list[tuple[str, str, int]]) -> list[tup
 # We parse that grid straight back into line items — so even a 270M model never
 # has to read a single number. This is the backbone of "Basic" mode.
 
-_TABLES_HDR_RE = re.compile(r"\[TABLES on page (\d+)\]")
+_TABLES_HDR_RE = re.compile(r"\[(OCR )?TABLES on page (\d+)\]")
 _TABLE_SEP_RE = re.compile(r"^-- table \d+ --$")
 # A bare note-reference cell: a small 1-3 digit integer (e.g. "12", "7a") printed
 # between the label and the money columns. NOT parenthesised (brackets = a negative
@@ -1660,7 +1965,8 @@ def parse_rendered_tables(text: str) -> list[dict]:
     out: list[dict] = []
     headers = list(_TABLES_HDR_RE.finditer(text))
     for hi, m in enumerate(headers):
-        page, start, body_start = int(m.group(1)), m.start(), m.end()
+        is_ocr = bool(m.group(1))                       # "[OCR TABLES …]" vs "[TABLES …]"
+        page, start, body_start = int(m.group(2)), m.start(), m.end()
         # the block ends at the next page delimiter, the next TABLES header, or EOF
         ends = [len(text)]
         nxt = text.find("\n===== PAGE", body_start)
@@ -1680,7 +1986,7 @@ def parse_rendered_tables(text: str) -> list[dict]:
                 tables[-1].append(raw.split(" | "))
         for rows in tables:
             if rows:
-                out.append({"page": page, "start": start, "rows": rows})
+                out.append({"page": page, "start": start, "rows": rows, "ocr": is_ocr})
     return out
 
 
@@ -1751,25 +2057,33 @@ def deterministic_statements(text: str, titles: list[tuple[str, str, int]],
     tables = parse_rendered_tables(text)
     if not tables:
         return {}
+    # Tables that sit in the notes / supplementary section must not bind to a
+    # primary statement title that happens to precede them in the same window.
+    bm = _NOTES_BOUNDARY_RE.search(text)
+    notes_at = bm.start() if bm else None
     slices = {st: chunk for (st, _t, chunk) in _slice_statements(text, titles)}
     title_for = {st: t for (st, t, _i) in titles}
     acc: dict[str, dict] = {}
     seen: dict[str, set] = {}
     for tbl in tables:
+        if notes_at is not None and tbl["start"] >= notes_at:
+            continue                       # this table is inside the notes — skip
         assoc = _assign_table_stype(tbl["start"], titles)
         if not assoc:
             continue
         stype, title = assoc
+        basis = "ocr" if tbl.get("ocr") else "parsed"   # OCR'd rows flagged for review
         for cells in tbl["rows"]:
             tri = _row_to_triplet(cells)
             if not tri:
                 continue
-            if tri["current"] is None and tri["prior"] is None \
-                    and not map_label_to_code(tri["label"], stype):
-                continue                       # a header / spacer row with no figures
+            if tri["current"] is None and tri["prior"] is None:
+                continue                       # no figure on this row — header / spacer / prose
+            if _NONITEM_LABEL_RE.match(tri["label"]) and not map_label_to_code(tri["label"], stype):
+                continue                       # date header / "attached notes" footer, no figure
             li = _build_line_item({"label": tri["label"], "current": tri["current"],
                                    "prior": tri["prior"]}, stype, prior_label,
-                                  note_ref=tri["note_ref"], basis="parsed")
+                                  note_ref=tri["note_ref"], basis=basis)
             if not li:
                 continue
             key = (" ".join(tri["label"].split()).lower(), li["value"])
@@ -2003,11 +2317,16 @@ def extract_filing_guided(pages: list[dict], args) -> dict:
     all_li = [li for s in merged.get("statements", []) for li in s.get("line_items", [])]
     n_parsed = sum(1 for li in all_li if li.get("basis") == "parsed")
     n_llm = sum(1 for li in all_li if li.get("basis") == "llm")
+    n_ocr = sum(1 for li in all_li if li.get("basis") == "ocr")
     n_codes = sum(1 for li in all_li if li.get("account_code"))
-    note = f"{len(all_li)} line item(s): {n_parsed} parsed from tables, {n_llm} from the model"
+    note = (f"{len(all_li)} line item(s): {n_parsed} parsed from tables, "
+            f"{n_ocr} read by OCR, {n_llm} from the model")
     eq = merged.setdefault("extraction_quality", {"confidence": None, "warnings": [], "unmapped_labels": []})
     eq.setdefault("warnings", []).append(note)
-    if eq.get("confidence") is None and all_li:        # mostly-parsed ⇒ high confidence
+    if n_ocr:
+        eq["warnings"].append(f"{n_ocr} value(s) were read from a scanned page by OCR — "
+                              "please spot-check these figures against the PDF.")
+    if eq.get("confidence") is None and all_li:        # parsed = high trust, OCR = lower
         eq["confidence"] = round(0.6 + 0.39 * (n_parsed / len(all_li)), 2)
     print(f"🧩 Assembled {len(merged.get('statements', []))} statement(s); {note}; "
           f"{n_codes} mapped to account codes.")
@@ -2246,10 +2565,19 @@ def run_filing(args) -> int:
     try:
         cfg = resolve_provider(args)    # fail fast on bad provider/key before any work
     except SystemExit:
+        explicit = getattr(args, "provider", None) or getattr(args, "llm_key", None)
         if no_llm:
             cfg = deterministic_cfg()   # fully offline — no provider needed at all
+        elif not explicit:
+            # Auto default: no key configured → read the numbers offline instead of
+            # failing. Set a provider key (or pass --no-llm) to change this.
+            print("ℹ️  No API key found — reading the numbers offline (deterministic). "
+                  "Add a provider key to .env to also capture the audit opinion & notes.")
+            cfg = deterministic_cfg()
+            no_llm = True
+            args.no_llm = True
         else:
-            raise
+            raise                       # they asked for a specific provider/key — surface it
     args.guided = resolve_guided(args, cfg)   # small/local models → Basic by default
     if no_llm:
         args.guided = True              # the deterministic-first orchestrator lives in Basic
